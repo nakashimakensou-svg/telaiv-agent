@@ -31,7 +31,7 @@ supabase: Client = create_client(
     os.environ["SUPABASE_SERVICE_ROLE_KEY"],
 )
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-live-001")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
 SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_MS = 20  # 20ms チャンク

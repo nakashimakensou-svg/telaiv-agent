@@ -129,7 +129,9 @@ async def run_conversation(
 
     live_config = genai_types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        system_instruction=full_instructions,
+        system_instruction=genai_types.Content(
+            parts=[genai_types.Part(text=full_instructions)],
+        ),
         speech_config=genai_types.SpeechConfig(
             voice_config=genai_types.VoiceConfig(
                 prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(

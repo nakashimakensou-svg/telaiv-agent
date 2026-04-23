@@ -286,17 +286,19 @@ async def run_conversation(
         ) as session:
             logger.info("Gemini Live session established")
 
-            tasks = [
+            # greeting は完了しても会話を続けるため wait に含めない
+            asyncio.create_task(trigger_greeting(session), name="greeting")
+
+            wait_tasks = [
                 asyncio.create_task(receive_audio(session), name="recv"),
                 asyncio.create_task(play_audio(),           name="play"),
                 asyncio.create_task(listen_audio(),         name="listen"),
                 asyncio.create_task(send_realtime(session), name="send"),
-                asyncio.create_task(trigger_greeting(session), name="greeting"),
             ]
             disc_task = asyncio.create_task(room_disconnected.wait(), name="disconnect")
 
             done, pending = await asyncio.wait(
-                tasks + [disc_task],
+                wait_tasks + [disc_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 

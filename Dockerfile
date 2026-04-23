@@ -17,4 +17,4 @@ COPY agent.py agent_genai.py ./
 # silero VAD モデルを事前ダウンロード（コールドスタート対策）
 RUN python -c "from livekit.plugins import silero; silero.VAD.load()" || true
 
-CMD ["python", "agent.py", "start"]
+CMD ["python", "agent_genai.py", "start"]

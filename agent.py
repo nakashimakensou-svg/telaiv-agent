@@ -264,8 +264,8 @@ async def entrypoint(ctx: JobContext) -> None:
         "Kore": "Kore", "Aoede": "Aoede", "Fenrir": "Fenrir",
     }
     voice = voice_map.get((config or {}).get("voice", "Puck"), "Puck")
-    model_id = (config or {}).get("model_version") or "gemini-3.1-flash-live-preview"
-    fallback_id = (config or {}).get("fallback_model") or "gemini-3.1-flash-live-preview"
+    model_id = (config or {}).get("model_version") or "gemini-2.5-flash-native-audio-preview-12-2025"
+    fallback_id = (config or {}).get("fallback_model") or "gemini-2.5-flash-native-audio-preview-12-2025"
 
     logger.info(f"Using Gemini model={model_id}, voice={voice}")
 

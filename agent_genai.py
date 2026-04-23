@@ -134,6 +134,10 @@ async def run_conversation(
 
     audio_stream = rtc.AudioStream(audio_track, sample_rate=SAMPLE_RATE, num_channels=CHANNELS)
 
+    # ルーム切断を検知して会話を終了するイベント
+    room_disconnected = asyncio.Event()
+    ctx.room.on("disconnected", lambda *_: room_disconnected.set())
+
     try:
         async with client.aio.live.connect(model=GEMINI_MODEL, config=live_config) as session:
             logger.info("Gemini Live session established")
@@ -152,15 +156,25 @@ async def run_conversation(
                 logger.info("recv_from_gemini: starting receive loop")
                 try:
                     async for response in session.receive():
-                        # ツール呼び出しや割り込みなど全レスポンスを記録
-                        if response.server_content is None:
-                            logger.debug(f"recv: non-content response: {response}")
-                            continue
+                        # 全レスポンスタイプをログ（デバッグ用）
+                        response_fields = {k: v for k, v in response.__dict__.items() if v is not None}
+                        logger.info(f"recv: response fields={list(response_fields.keys())}")
+
                         sc = response.server_content
+                        if sc is None:
+                            logger.info(f"recv: no server_content, full={response}")
+                            continue
+
+                        logger.info(f"recv: server_content turn_complete={sc.turn_complete} has_model_turn={sc.model_turn is not None}")
+
                         if sc.turn_complete:
-                            logger.info("recv: turn_complete received")
+                            logger.info("recv: turn_complete — waiting for user audio")
+
                         if sc.model_turn:
                             for part in sc.model_turn.parts:
+                                logger.info(f"recv: part has_inline_data={part.inline_data is not None} has_text={part.text is not None}")
+                                if part.inline_data:
+                                    logger.info(f"recv: inline_data mime={part.inline_data.mime_type} size={len(part.inline_data.data)}")
                                 if part.inline_data and part.inline_data.mime_type.startswith("audio/"):
                                     raw = part.inline_data.data
                                     audio_chunks += 1
@@ -183,6 +197,8 @@ async def run_conversation(
                                     for kw in escalation_kw:
                                         if kw in part.text:
                                             escalated = True
+                except asyncio.CancelledError:
+                    logger.info("recv_from_gemini: cancelled")
                 except Exception:
                     logger.error("recv_from_gemini error", exc_info=True)
                     raise
@@ -206,23 +222,42 @@ async def run_conversation(
                                 )
                             )
                         )
+                except asyncio.CancelledError:
+                    logger.info("send_to_gemini: cancelled")
                 except Exception:
                     logger.error("send_to_gemini error", exc_info=True)
                     raise
                 finally:
                     logger.info(f"send_to_gemini: loop ended (frames_sent={frames_sent})")
 
-            results = await asyncio.gather(
-                recv_from_gemini(),
-                send_to_gemini(),
-                return_exceptions=True,
+            async def wait_for_disconnect():
+                await room_disconnected.wait()
+                logger.info("room disconnected — stopping conversation")
+
+            # recv/send/room切断 のいずれか1つが終わったら残りをキャンセル
+            recv_task = asyncio.create_task(recv_from_gemini(), name="recv")
+            send_task = asyncio.create_task(send_to_gemini(), name="send")
+            disc_task = asyncio.create_task(wait_for_disconnect(), name="disconnect")
+
+            done, pending = await asyncio.wait(
+                [recv_task, send_task, disc_task],
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            for i, result in enumerate(results):
-                name = ["recv_from_gemini", "send_to_gemini"][i]
-                if isinstance(result, Exception):
-                    logger.error(f"{name} raised: {type(result).__name__}: {result}")
+
+            for task in done:
+                exc = task.exception() if not task.cancelled() else None
+                if exc:
+                    logger.error(f"Task {task.get_name()} failed: {type(exc).__name__}: {exc}")
                 else:
-                    logger.info(f"{name} completed normally")
+                    logger.info(f"Task {task.get_name()} completed first")
+
+            for task in pending:
+                logger.info(f"Cancelling pending task: {task.get_name()}")
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     except Exception:
         logger.error("run_conversation error", exc_info=True)

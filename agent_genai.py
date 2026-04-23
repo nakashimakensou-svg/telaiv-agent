@@ -166,9 +166,11 @@ async def run_conversation(
             async for frame_event in audio_stream:
                 frame = frame_event.frame
                 await session.send(
-                    input=genai_types.Blob(
-                        data=bytes(frame.data),
-                        mime_type=f"audio/pcm;rate={SAMPLE_RATE}",
+                    input=genai_types.LiveClientRealtimeInput(
+                        audio=genai_types.Blob(
+                            data=bytes(frame.data),
+                            mime_type=f"audio/pcm;rate={SAMPLE_RATE}",
+                        )
                     )
                 )
 

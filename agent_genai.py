@@ -1,6 +1,7 @@
 """
-Telaiv LiveKit Agent — google-genai SDK 直接実装
-livekit-plugins-google を経由せず google.genai.live を直接使って Gemini Live に接続する
+Telaiv LiveKit Agent — google-genai SDK direct implementation
+Based on official Google Gemini cookbook Live API examples.
+https://github.com/google-gemini/cookbook/tree/main/quickstarts
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
-
 from livekit import rtc
 from livekit.agents import JobContext, WorkerOptions, cli
 from google import genai
@@ -25,7 +25,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telaiv-agent-genai")
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
-SAMPLE_RATE = 16000
+
+# Gemini Live I/O sample rates (per official cookbook)
+SEND_SAMPLE_RATE = 16000   # LiveKit → Gemini: 16kHz PCM
+RECV_SAMPLE_RATE = 24000   # Gemini → LiveKit: 24kHz PCM
 CHANNELS = 1
 
 DEFAULT_GREETING = "はい、お電話ありがとうございます。"
@@ -37,6 +40,8 @@ DEFAULT_SYSTEM_PROMPT = """\
 DEFAULT_ESCALATION_KEYWORDS = ["クレーム", "担当者", "責任者", "上の者", "社長"]
 
 
+# ─── Supabase (lazy init to avoid module-level crash) ──────────────────────
+
 def _get_supabase():
     from supabase import create_client
     return create_client(
@@ -44,8 +49,6 @@ def _get_supabase():
         os.environ["SUPABASE_SERVICE_ROLE_KEY"],
     )
 
-
-# ─── Supabase ヘルパー ────────────────────────────────────────────────────────
 
 async def get_concierge_config(called_number: str) -> Optional[dict]:
     try:
@@ -96,7 +99,7 @@ async def save_ai_conversation(
         logger.error(f"save_ai_conversation error: {e}")
 
 
-# ─── メイン会話ループ ─────────────────────────────────────────────────────────
+# ─── Conversation bridge ────────────────────────────────────────────────────
 
 async def run_conversation(
     ctx: JobContext,
@@ -104,7 +107,6 @@ async def run_conversation(
     audio_source: rtc.AudioSource,
     audio_track: rtc.RemoteAudioTrack,
 ) -> tuple[list[dict], str]:
-    """Gemini Live と音声を双方向にブリッジする"""
 
     company = (config or {}).get("company_name") or "弊社"
     greeting_tmpl = (config or {}).get("greeting_template") or DEFAULT_GREETING
@@ -113,19 +115,32 @@ async def run_conversation(
     escalation_kw = (config or {}).get("escalation_keywords") or DEFAULT_ESCALATION_KEYWORDS
     voice = (config or {}).get("voice") or "Puck"
 
-    # system_instructionに挨拶を組み込む（Geminiが自発的に発話するよう指示）
     full_instructions = (
         f"{system_prompt}\n"
         f"会社名: {company}\n\n"
-        f"【重要】会話が開始されたら、まず最初に必ず次の挨拶を日本語で声に出してください:\n"
-        f"「{greeting}」\n"
-        f"ユーザーの発言を待たず、即座に挨拶してください。"
+        f"【重要】会話が始まったら、ユーザーの発言を待たずに即座に次のセリフで挨拶してください:\n"
+        f"「{greeting}」"
     )
 
     transcript: list[dict] = []
     escalated = False
 
-    client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+    # Queue: Gemini → LiveKit (PCM bytes at 24kHz)
+    audio_in_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    # Queue: LiveKit → Gemini (dict with data + mime_type)
+    out_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=5)
+
+    # LiveKit audio input stream (resampled to 16kHz by SDK)
+    audio_stream = rtc.AudioStream(
+        audio_track,
+        sample_rate=SEND_SAMPLE_RATE,
+        num_channels=CHANNELS,
+    )
+
+    client = genai.Client(
+        api_key=os.environ["GOOGLE_API_KEY"],
+        http_options={"api_version": "v1beta"},
+    )
 
     live_config = genai_types.LiveConnectConfig(
         response_modalities=["AUDIO"],
@@ -141,143 +156,175 @@ async def run_conversation(
         ),
     )
 
-    audio_stream = rtc.AudioStream(audio_track, sample_rate=SAMPLE_RATE, num_channels=CHANNELS)
-
-    # ルーム切断を検知して会話を終了するイベント
     room_disconnected = asyncio.Event()
     ctx.room.on("disconnected", lambda *_: room_disconnected.set())
 
+    # ── タスク関数 ──────────────────────────────────────────────────────────
+
+    async def listen_audio():
+        """LiveKit音声フレームを out_queue に積む (16kHz PCM)"""
+        logger.info("listen_audio: started")
+        frames = 0
+        try:
+            async for frame_event in audio_stream:
+                data = bytes(frame_event.frame.data)
+                frames += 1
+                if frames == 1:
+                    logger.info("listen_audio: first frame received from LiveKit")
+                try:
+                    out_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})
+                except asyncio.QueueFull:
+                    # リアルタイム性維持: 最古フレームを捨てて新しいフレームを入れる
+                    out_queue.get_nowait()
+                    out_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.error("listen_audio error", exc_info=True)
+            raise
+        finally:
+            logger.info(f"listen_audio: ended (frames={frames})")
+
+    async def send_realtime(session):
+        """out_queue から Gemini に音声を送る"""
+        logger.info("send_realtime: started")
+        sent = 0
+        try:
+            while True:
+                msg = await out_queue.get()
+                await session.send_realtime_input(audio=msg)
+                sent += 1
+                if sent == 1:
+                    logger.info("send_realtime: first audio chunk sent to Gemini")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.error("send_realtime error", exc_info=True)
+            raise
+        finally:
+            logger.info(f"send_realtime: ended (sent={sent})")
+
+    async def receive_audio(session):
+        """Gemini から音声を受け取り audio_in_queue に積む (ターン単位ループ)"""
+        nonlocal escalated
+        logger.info("receive_audio: started")
+        total_chunks = 0
+        try:
+            while True:
+                turn = session.receive()
+                async for response in turn:
+                    # response.data: 24kHz PCM バイト列 (inline_data shortcut)
+                    if response.data:
+                        total_chunks += 1
+                        if total_chunks == 1:
+                            logger.info(f"receive_audio: first audio chunk from Gemini ({len(response.data)} bytes)")
+                        audio_in_queue.put_nowait(response.data)
+
+                    # response.text: テキスト転写
+                    if response.text:
+                        logger.info(f"receive_audio: agent text: {response.text!r}")
+                        transcript.append({
+                            "role": "agent",
+                            "text": response.text,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                        for kw in escalation_kw:
+                            if kw in response.text:
+                                escalated = True
+
+                # ターン完了 — 割り込み時に残留音声をフラッシュ
+                logger.info(f"receive_audio: turn complete (total_chunks={total_chunks})")
+                while not audio_in_queue.empty():
+                    audio_in_queue.get_nowait()
+
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.error("receive_audio error", exc_info=True)
+            raise
+        finally:
+            logger.info(f"receive_audio: ended (total_chunks={total_chunks})")
+
+    async def play_audio():
+        """audio_in_queue の24kHz PCM を LiveKit AudioSource に流す"""
+        logger.info("play_audio: started")
+        played = 0
+        try:
+            while True:
+                pcm = await audio_in_queue.get()
+                played += 1
+                frame = rtc.AudioFrame(
+                    data=pcm,
+                    sample_rate=RECV_SAMPLE_RATE,  # 24kHz (Gemini output)
+                    num_channels=CHANNELS,
+                    samples_per_channel=len(pcm) // 2,
+                )
+                await audio_source.capture_frame(frame)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.error("play_audio error", exc_info=True)
+            raise
+        finally:
+            logger.info(f"play_audio: ended (played={played})")
+
+    async def trigger_greeting(session):
+        """receive_audio が起動してから無音を送り、Gemini に挨拶を促す"""
+        await asyncio.sleep(0.3)
+        # 200ms の無音 PCM (16kHz, 16bit, mono)
+        silence = bytes(SEND_SAMPLE_RATE * CHANNELS * 2 * 2 // 10)
+        await session.send_realtime_input(
+            audio={"data": silence, "mime_type": "audio/pcm"}
+        )
+        logger.info("trigger_greeting: silence sent to prompt Gemini greeting")
+
+    # ── セッション確立 + タスク実行 ─────────────────────────────────────────
+
     try:
-        async with client.aio.live.connect(model=GEMINI_MODEL, config=live_config) as session:
+        async with client.aio.live.connect(
+            model=GEMINI_MODEL, config=live_config
+        ) as session:
             logger.info("Gemini Live session established")
 
-            # 無音PCMを送って VAD をトリガーし、Gemini に挨拶を発話させる
-            # 300ms of silence: 16kHz * 0.3s * 2bytes = 9600 bytes
-            try:
-                silence = bytes(SAMPLE_RATE * CHANNELS * 2 * 3 // 10)  # 300ms
-                await session.send_realtime_input(
-                    audio=genai_types.Blob(data=silence, mime_type=f"audio/pcm;rate={SAMPLE_RATE}"),
-                )
-                logger.info("Silence sent to trigger greeting")
-            except Exception:
-                logger.error("Failed to send silence trigger", exc_info=True)
-                raise
-
-            async def recv_from_gemini():
-                nonlocal escalated
-                audio_chunks = 0
-                logger.info("recv_from_gemini: starting receive loop")
-                try:
-                    async for response in session.receive():
-                        # 全レスポンスタイプをログ（デバッグ用）
-                        response_fields = {k: v for k, v in response.__dict__.items() if v is not None}
-                        logger.info(f"recv: response fields={list(response_fields.keys())}")
-
-                        sc = response.server_content
-                        if sc is None:
-                            logger.info(f"recv: no server_content, full={response}")
-                            continue
-
-                        logger.info(f"recv: server_content turn_complete={sc.turn_complete} has_model_turn={sc.model_turn is not None}")
-
-                        if sc.turn_complete:
-                            logger.info("recv: turn_complete — waiting for user audio")
-
-                        if sc.model_turn:
-                            for part in sc.model_turn.parts:
-                                logger.info(f"recv: part has_inline_data={part.inline_data is not None} has_text={part.text is not None}")
-                                if part.inline_data:
-                                    logger.info(f"recv: inline_data mime={part.inline_data.mime_type} size={len(part.inline_data.data)}")
-                                if part.inline_data and part.inline_data.mime_type.startswith("audio/"):
-                                    raw = part.inline_data.data
-                                    audio_chunks += 1
-                                    if audio_chunks == 1:
-                                        logger.info(f"recv: first audio chunk ({len(raw)} bytes)")
-                                    frame = rtc.AudioFrame(
-                                        data=raw,
-                                        sample_rate=SAMPLE_RATE,
-                                        num_channels=CHANNELS,
-                                        samples_per_channel=len(raw) // 2,
-                                    )
-                                    await audio_source.capture_frame(frame)
-                                if part.text:
-                                    logger.info(f"recv: agent text: {part.text!r}")
-                                    transcript.append({
-                                        "role": "agent",
-                                        "text": part.text,
-                                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                                    })
-                                    for kw in escalation_kw:
-                                        if kw in part.text:
-                                            escalated = True
-                except asyncio.CancelledError:
-                    logger.info("recv_from_gemini: cancelled")
-                except Exception:
-                    logger.error("recv_from_gemini error", exc_info=True)
-                    raise
-                finally:
-                    logger.info(f"recv_from_gemini: loop ended (audio_chunks={audio_chunks})")
-
-            async def send_to_gemini():
-                frames_sent = 0
-                logger.info("send_to_gemini: starting audio stream loop")
-                try:
-                    async for frame_event in audio_stream:
-                        frame = frame_event.frame
-                        frames_sent += 1
-                        if frames_sent == 1:
-                            logger.info("send_to_gemini: first audio frame sent to Gemini")
-                        await session.send_realtime_input(
-                            audio=genai_types.Blob(
-                                data=bytes(frame.data),
-                                mime_type=f"audio/pcm;rate={SAMPLE_RATE}",
-                            )
-                        )
-                except asyncio.CancelledError:
-                    logger.info("send_to_gemini: cancelled")
-                except Exception:
-                    logger.error("send_to_gemini error", exc_info=True)
-                    raise
-                finally:
-                    logger.info(f"send_to_gemini: loop ended (frames_sent={frames_sent})")
-
-            async def wait_for_disconnect():
-                await room_disconnected.wait()
-                logger.info("room disconnected — stopping conversation")
-
-            # recv/send/room切断 のいずれか1つが終わったら残りをキャンセル
-            recv_task = asyncio.create_task(recv_from_gemini(), name="recv")
-            send_task = asyncio.create_task(send_to_gemini(), name="send")
-            disc_task = asyncio.create_task(wait_for_disconnect(), name="disconnect")
+            tasks = [
+                asyncio.create_task(receive_audio(session), name="recv"),
+                asyncio.create_task(play_audio(),           name="play"),
+                asyncio.create_task(listen_audio(),         name="listen"),
+                asyncio.create_task(send_realtime(session), name="send"),
+                asyncio.create_task(trigger_greeting(session), name="greeting"),
+            ]
+            disc_task = asyncio.create_task(room_disconnected.wait(), name="disconnect")
 
             done, pending = await asyncio.wait(
-                [recv_task, send_task, disc_task],
+                tasks + [disc_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            for task in done:
-                exc = task.exception() if not task.cancelled() else None
-                if exc:
-                    logger.error(f"Task {task.get_name()} failed: {type(exc).__name__}: {exc}")
+            for t in done:
+                if not t.cancelled() and t.exception():
+                    logger.error(
+                        f"Task '{t.get_name()}' failed: "
+                        f"{type(t.exception()).__name__}: {t.exception()}"
+                    )
                 else:
-                    logger.info(f"Task {task.get_name()} completed first")
+                    logger.info(f"Task '{t.get_name()}' completed first")
 
-            for task in pending:
-                logger.info(f"Cancelling pending task: {task.get_name()}")
-                task.cancel()
+            for t in pending:
+                t.cancel()
                 try:
-                    await task
+                    await t
                 except (asyncio.CancelledError, Exception):
                     pass
 
     except Exception:
-        logger.error("run_conversation error", exc_info=True)
+        logger.error("run_conversation: session error", exc_info=True)
 
     outcome = "escalated" if escalated else ("resolved" if transcript else "abandoned")
+    logger.info(f"run_conversation: done outcome={outcome}")
     return transcript, outcome
 
 
-# ─── エントリーポイント ───────────────────────────────────────────────────────
+# ─── Entrypoint ────────────────────────────────────────────────────────────
 
 async def entrypoint(ctx: JobContext) -> None:
     logger.info(f"Job started: room={ctx.room.name}")
@@ -304,13 +351,14 @@ async def entrypoint(ctx: JobContext) -> None:
                 break
 
     logger.info(f"called_number={called_number}")
-
     config = await get_concierge_config(called_number) if called_number else None
 
-    audio_source = rtc.AudioSource(SAMPLE_RATE, CHANNELS)
+    # AudioSource は Gemini の出力サンプルレート (24kHz) で作成
+    audio_source = rtc.AudioSource(RECV_SAMPLE_RATE, CHANNELS)
     local_track = rtc.LocalAudioTrack.create_audio_track("agent-audio", audio_source)
     await ctx.room.local_participant.publish_track(local_track)
 
+    # SIP 参加者の音声トラックを待機 (最大15秒)
     audio_track: Optional[rtc.RemoteAudioTrack] = None
     for _ in range(30):
         for p in ctx.room.remote_participants.values():
@@ -342,6 +390,8 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     logger.info(f"Job completed: outcome={outcome} duration={duration}s")
 
+
+# ─── Worker ────────────────────────────────────────────────────────────────
 
 def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
     exc = context.get("exception")

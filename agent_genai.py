@@ -142,10 +142,16 @@ async def run_conversation(
         async with client.aio.live.connect(model=GEMINI_MODEL, config=live_config) as session:
             logger.info("Gemini Live session established")
 
-            # グリーティング送信
+            # グリーティング送信 (send_client_content で turn_complete=True を明示)
             try:
-                await session.send(input=greeting, end_of_turn=True)
-                logger.info(f"Greeting sent: {greeting!r}")
+                await session.send_client_content(
+                    turns=genai_types.Content(
+                        role="user",
+                        parts=[genai_types.Part(text=greeting)],
+                    ),
+                    turn_complete=True,
+                )
+                logger.info(f"Greeting sent via send_client_content: {greeting!r}")
             except Exception:
                 logger.error("Failed to send greeting", exc_info=True)
                 raise
@@ -214,12 +220,10 @@ async def run_conversation(
                         frames_sent += 1
                         if frames_sent == 1:
                             logger.info("send_to_gemini: first audio frame sent to Gemini")
-                        await session.send(
-                            input=genai_types.LiveClientRealtimeInput(
-                                audio=genai_types.Blob(
-                                    data=bytes(frame.data),
-                                    mime_type=f"audio/pcm;rate={SAMPLE_RATE}",
-                                )
+                        await session.send_realtime_input(
+                            audio=genai_types.Blob(
+                                data=bytes(frame.data),
+                                mime_type=f"audio/pcm;rate={SAMPLE_RATE}",
                             )
                         )
                 except asyncio.CancelledError:

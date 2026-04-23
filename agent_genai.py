@@ -1,7 +1,6 @@
 """
 Telaiv LiveKit Agent — google-genai SDK 直接実装
-livekit-plugins-google の mediaChunks 問題を回避するため
-google.genai.live を直接使って Gemini Live に接続する
+livekit-plugins-google を経由せず google.genai.live を直接使って Gemini Live に接続する
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
-from supabase import create_client, Client
 
 from livekit import rtc
 from livekit.agents import JobContext, WorkerOptions, cli
@@ -26,15 +24,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telaiv-agent-genai")
 
-supabase: Client = create_client(
-    os.environ["SUPABASE_URL"],
-    os.environ["SUPABASE_SERVICE_ROLE_KEY"],
-)
-
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
 SAMPLE_RATE = 16000
 CHANNELS = 1
-CHUNK_MS = 20  # 20ms チャンク
 
 DEFAULT_GREETING = "はい、お電話ありがとうございます。"
 DEFAULT_SYSTEM_PROMPT = """\
@@ -45,11 +37,20 @@ DEFAULT_SYSTEM_PROMPT = """\
 DEFAULT_ESCALATION_KEYWORDS = ["クレーム", "担当者", "責任者", "上の者", "社長"]
 
 
+def _get_supabase():
+    from supabase import create_client
+    return create_client(
+        os.environ["SUPABASE_URL"],
+        os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+    )
+
+
 # ─── Supabase ヘルパー ────────────────────────────────────────────────────────
 
 async def get_concierge_config(called_number: str) -> Optional[dict]:
     try:
-        pn = supabase.from_("phone_numbers") \
+        sb = _get_supabase()
+        pn = sb.from_("phone_numbers") \
             .select("id, tenant_id") \
             .eq("number", called_number) \
             .eq("is_active", True) \
@@ -59,7 +60,7 @@ async def get_concierge_config(called_number: str) -> Optional[dict]:
         phone_number_id = pn.data[0]["id"]
         tenant_id = pn.data[0]["tenant_id"]
 
-        cc = supabase.from_("concierge_configs") \
+        cc = sb.from_("concierge_configs") \
             .select("*") \
             .eq("phone_number_id", phone_number_id) \
             .eq("is_enabled", True) \
@@ -82,7 +83,8 @@ async def save_ai_conversation(
     if not config or not config.get("tenant_id"):
         return
     try:
-        supabase.from_("ai_conversations").insert({
+        sb = _get_supabase()
+        sb.from_("ai_conversations").insert({
             "tenant_id": config["tenant_id"],
             "transcript_json": transcript,
             "outcome": outcome,
@@ -109,6 +111,7 @@ async def run_conversation(
     greeting = greeting_tmpl.replace("{company}", company)
     system_prompt = (config or {}).get("system_prompt") or DEFAULT_SYSTEM_PROMPT
     escalation_kw = (config or {}).get("escalation_keywords") or DEFAULT_ESCALATION_KEYWORDS
+    voice = (config or {}).get("voice") or "Puck"
 
     full_instructions = f"{system_prompt}\n会社名: {company}"
 
@@ -123,7 +126,7 @@ async def run_conversation(
         speech_config=genai_types.SpeechConfig(
             voice_config=genai_types.VoiceConfig(
                 prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
-                    voice_name=(config or {}).get("voice") or "Puck"
+                    voice_name=voice,
                 )
             )
         ),
@@ -138,17 +141,20 @@ async def run_conversation(
         await session.send(input=greeting, end_of_turn=True)
 
         async def recv_from_gemini():
-            """Gemini の音声応答を LiveKit ルームに流す"""
             nonlocal escalated
             async for response in session.receive():
-                if response.server_content:
-                    for part in (response.server_content.model_turn.parts if response.server_content.model_turn else []):
+                sc = response.server_content
+                if not sc:
+                    continue
+                if sc.model_turn:
+                    for part in sc.model_turn.parts:
                         if part.inline_data and part.inline_data.mime_type.startswith("audio/"):
+                            raw = part.inline_data.data
                             frame = rtc.AudioFrame(
-                                data=part.inline_data.data,
+                                data=raw,
                                 sample_rate=SAMPLE_RATE,
                                 num_channels=CHANNELS,
-                                samples_per_channel=len(part.inline_data.data) // 2,
+                                samples_per_channel=len(raw) // 2,
                             )
                             await audio_source.capture_frame(frame)
                         if part.text:
@@ -162,7 +168,6 @@ async def run_conversation(
                                     escalated = True
 
         async def send_to_gemini():
-            """LiveKit ルームの音声を Gemini に送る"""
             async for frame_event in audio_stream:
                 frame = frame_event.frame
                 await session.send(
@@ -191,7 +196,6 @@ async def entrypoint(ctx: JobContext) -> None:
 
     start_time = datetime.now(timezone.utc)
 
-    # 着信番号の取得
     called_number: Optional[str] = None
     try:
         room_meta = json.loads(ctx.room.metadata or "{}")
@@ -214,14 +218,12 @@ async def entrypoint(ctx: JobContext) -> None:
 
     config = await get_concierge_config(called_number) if called_number else None
 
-    # LiveKit 音声 I/O セットアップ
     audio_source = rtc.AudioSource(SAMPLE_RATE, CHANNELS)
     local_track = rtc.LocalAudioTrack.create_audio_track("agent-audio", audio_source)
     await ctx.room.local_participant.publish_track(local_track)
 
-    # SIP 参加者の音声トラックを待機
     audio_track: Optional[rtc.RemoteAudioTrack] = None
-    for attempt in range(30):
+    for _ in range(30):
         for p in ctx.room.remote_participants.values():
             for pub in p.track_publications.values():
                 if pub.track and isinstance(pub.track, rtc.RemoteAudioTrack):

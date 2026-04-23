@@ -31,6 +31,18 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("telaiv-agent")
 
+
+def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """LiveKit SDK 内部の track_publications KeyError を握りつぶす。
+    local_track_unpublished でトラック削除と切断が競合する既知のバグ。"""
+    exc = context.get("exception")
+    msg = context.get("message", "")
+    if isinstance(exc, KeyError) and "local_track_unpublished" in msg:
+        return
+    if isinstance(exc, KeyError) and str(exc).startswith("'TR_"):
+        return
+    loop.default_exception_handler(context)
+
 # ─── Supabase クライアント ────────────────────────────────────────────────────
 supabase: Client = create_client(
     os.environ["SUPABASE_URL"],
@@ -307,6 +319,8 @@ async def entrypoint(ctx: JobContext) -> None:
 # ─── Worker 起動 ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(_asyncio_exception_handler)
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,

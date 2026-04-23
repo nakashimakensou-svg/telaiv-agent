@@ -172,7 +172,10 @@ class TelaivAssistant(Agent):
     async def on_enter(self) -> None:
         """ルームに入ったらグリーティングを再生"""
         logger.info(f"Agent entered room, greeting: {self._greeting}")
-        await self.session.say(self._greeting, allow_interruptions=True)
+        # RealtimeModel はTTS内蔵のため generate_reply でグリーティングを発話
+        await self.session.generate_reply(
+            instructions=self._greeting
+        )
 
     async def on_user_turn_completed(
         self, turn_ctx, new_message
@@ -189,9 +192,8 @@ class TelaivAssistant(Agent):
             if kw in text:
                 logger.info(f"Escalation keyword detected: {kw}")
                 self._escalated = True
-                await self.session.say(
-                    "少々お待ちください。担当者におつなぎします。",
-                    allow_interruptions=False,
+                await self.session.generate_reply(
+                    instructions="少々お待ちください。担当者におつなぎします。",
                 )
                 await self.session.room.disconnect()
                 return
@@ -276,7 +278,6 @@ async def entrypoint(ctx: JobContext) -> None:
             voice=voice,
             api_key=os.environ["GOOGLE_API_KEY"],
             instructions=assistant.instructions,
-            thinking_level="minimal",
         )
     except Exception as e:
         logger.warning(f"Primary model {model_id} failed ({e}), trying fallback {fallback_id}")
@@ -295,14 +296,14 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(
         room=ctx.room,
         agent=assistant,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=True,
-        ),
+        room_input_options=RoomInputOptions(),
     )
 
     # ── 通話終了まで待機してから後処理 ───────────────────────────────────────
+    disconnect_event = asyncio.Event()
+    ctx.room.on("disconnected", lambda *_: disconnect_event.set())
     try:
-        await ctx.wait_for_disconnect()
+        await disconnect_event.wait()
     finally:
         logger.info("Call ended, saving conversation log")
         await save_ai_conversation(

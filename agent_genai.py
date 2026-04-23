@@ -113,7 +113,14 @@ async def run_conversation(
     escalation_kw = (config or {}).get("escalation_keywords") or DEFAULT_ESCALATION_KEYWORDS
     voice = (config or {}).get("voice") or "Puck"
 
-    full_instructions = f"{system_prompt}\n会社名: {company}"
+    # system_instructionに挨拶を組み込む（Geminiが自発的に発話するよう指示）
+    full_instructions = (
+        f"{system_prompt}\n"
+        f"会社名: {company}\n\n"
+        f"【重要】会話が開始されたら、まず最初に必ず次の挨拶を日本語で声に出してください:\n"
+        f"「{greeting}」\n"
+        f"ユーザーの発言を待たず、即座に挨拶してください。"
+    )
 
     transcript: list[dict] = []
     escalated = False
@@ -142,18 +149,16 @@ async def run_conversation(
         async with client.aio.live.connect(model=GEMINI_MODEL, config=live_config) as session:
             logger.info("Gemini Live session established")
 
-            # グリーティング送信 (send_client_content で turn_complete=True を明示)
+            # 無音PCMを送って VAD をトリガーし、Gemini に挨拶を発話させる
+            # 300ms of silence: 16kHz * 0.3s * 2bytes = 9600 bytes
             try:
-                await session.send_client_content(
-                    turns=genai_types.Content(
-                        role="user",
-                        parts=[genai_types.Part(text=greeting)],
-                    ),
-                    turn_complete=True,
+                silence = bytes(SAMPLE_RATE * CHANNELS * 2 * 3 // 10)  # 300ms
+                await session.send_realtime_input(
+                    audio=genai_types.Blob(data=silence, mime_type=f"audio/pcm;rate={SAMPLE_RATE}"),
                 )
-                logger.info(f"Greeting sent via send_client_content: {greeting!r}")
+                logger.info("Silence sent to trigger greeting")
             except Exception:
-                logger.error("Failed to send greeting", exc_info=True)
+                logger.error("Failed to send silence trigger", exc_info=True)
                 raise
 
             async def recv_from_gemini():

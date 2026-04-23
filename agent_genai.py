@@ -134,55 +134,98 @@ async def run_conversation(
 
     audio_stream = rtc.AudioStream(audio_track, sample_rate=SAMPLE_RATE, num_channels=CHANNELS)
 
-    async with client.aio.live.connect(model=GEMINI_MODEL, config=live_config) as session:
-        logger.info("Gemini Live session established")
+    try:
+        async with client.aio.live.connect(model=GEMINI_MODEL, config=live_config) as session:
+            logger.info("Gemini Live session established")
 
-        # グリーティング送信
-        await session.send(input=greeting, end_of_turn=True)
+            # グリーティング送信
+            try:
+                await session.send(input=greeting, end_of_turn=True)
+                logger.info(f"Greeting sent: {greeting!r}")
+            except Exception:
+                logger.error("Failed to send greeting", exc_info=True)
+                raise
 
-        async def recv_from_gemini():
-            nonlocal escalated
-            async for response in session.receive():
-                sc = response.server_content
-                if not sc:
-                    continue
-                if sc.model_turn:
-                    for part in sc.model_turn.parts:
-                        if part.inline_data and part.inline_data.mime_type.startswith("audio/"):
-                            raw = part.inline_data.data
-                            frame = rtc.AudioFrame(
-                                data=raw,
-                                sample_rate=SAMPLE_RATE,
-                                num_channels=CHANNELS,
-                                samples_per_channel=len(raw) // 2,
+            async def recv_from_gemini():
+                nonlocal escalated
+                audio_chunks = 0
+                logger.info("recv_from_gemini: starting receive loop")
+                try:
+                    async for response in session.receive():
+                        # ツール呼び出しや割り込みなど全レスポンスを記録
+                        if response.server_content is None:
+                            logger.debug(f"recv: non-content response: {response}")
+                            continue
+                        sc = response.server_content
+                        if sc.turn_complete:
+                            logger.info("recv: turn_complete received")
+                        if sc.model_turn:
+                            for part in sc.model_turn.parts:
+                                if part.inline_data and part.inline_data.mime_type.startswith("audio/"):
+                                    raw = part.inline_data.data
+                                    audio_chunks += 1
+                                    if audio_chunks == 1:
+                                        logger.info(f"recv: first audio chunk ({len(raw)} bytes)")
+                                    frame = rtc.AudioFrame(
+                                        data=raw,
+                                        sample_rate=SAMPLE_RATE,
+                                        num_channels=CHANNELS,
+                                        samples_per_channel=len(raw) // 2,
+                                    )
+                                    await audio_source.capture_frame(frame)
+                                if part.text:
+                                    logger.info(f"recv: agent text: {part.text!r}")
+                                    transcript.append({
+                                        "role": "agent",
+                                        "text": part.text,
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    })
+                                    for kw in escalation_kw:
+                                        if kw in part.text:
+                                            escalated = True
+                except Exception:
+                    logger.error("recv_from_gemini error", exc_info=True)
+                    raise
+                finally:
+                    logger.info(f"recv_from_gemini: loop ended (audio_chunks={audio_chunks})")
+
+            async def send_to_gemini():
+                frames_sent = 0
+                logger.info("send_to_gemini: starting audio stream loop")
+                try:
+                    async for frame_event in audio_stream:
+                        frame = frame_event.frame
+                        frames_sent += 1
+                        if frames_sent == 1:
+                            logger.info("send_to_gemini: first audio frame sent to Gemini")
+                        await session.send(
+                            input=genai_types.LiveClientRealtimeInput(
+                                audio=genai_types.Blob(
+                                    data=bytes(frame.data),
+                                    mime_type=f"audio/pcm;rate={SAMPLE_RATE}",
+                                )
                             )
-                            await audio_source.capture_frame(frame)
-                        if part.text:
-                            transcript.append({
-                                "role": "agent",
-                                "text": part.text,
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                            })
-                            for kw in escalation_kw:
-                                if kw in part.text:
-                                    escalated = True
-
-        async def send_to_gemini():
-            async for frame_event in audio_stream:
-                frame = frame_event.frame
-                await session.send(
-                    input=genai_types.LiveClientRealtimeInput(
-                        audio=genai_types.Blob(
-                            data=bytes(frame.data),
-                            mime_type=f"audio/pcm;rate={SAMPLE_RATE}",
                         )
-                    )
-                )
+                except Exception:
+                    logger.error("send_to_gemini error", exc_info=True)
+                    raise
+                finally:
+                    logger.info(f"send_to_gemini: loop ended (frames_sent={frames_sent})")
 
-        try:
-            await asyncio.gather(recv_from_gemini(), send_to_gemini())
-        except Exception as e:
-            logger.info(f"Conversation ended: {e}")
+            results = await asyncio.gather(
+                recv_from_gemini(),
+                send_to_gemini(),
+                return_exceptions=True,
+            )
+            for i, result in enumerate(results):
+                name = ["recv_from_gemini", "send_to_gemini"][i]
+                if isinstance(result, Exception):
+                    logger.error(f"{name} raised: {type(result).__name__}: {result}")
+                else:
+                    logger.info(f"{name} completed normally")
+
+    except Exception:
+        logger.error("run_conversation error", exc_info=True)
 
     outcome = "escalated" if escalated else ("resolved" if transcript else "abandoned")
     return transcript, outcome

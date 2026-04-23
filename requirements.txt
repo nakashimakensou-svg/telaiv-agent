@@ -1,4 +1,4 @@
-livekit-agents[google,silero]==1.5.6
+livekit-agents[google,silero]==1.5.1
 livekit==1.1.5
 livekit-plugins-google==1.5.1
 supabase>=2.10.0

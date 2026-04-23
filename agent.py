@@ -262,8 +262,8 @@ async def entrypoint(ctx: JobContext) -> None:
         "Kore": "Kore", "Aoede": "Aoede", "Fenrir": "Fenrir",
     }
     voice = voice_map.get((config or {}).get("voice", "Puck"), "Puck")
-    model_id = (config or {}).get("model_version") or "gemini-live-2.0-flash-001"
-    fallback_id = (config or {}).get("fallback_model") or "gemini-live-2.0-flash-001"
+    model_id = (config or {}).get("model_version") or "gemini-3.1-flash-live-preview"
+    fallback_id = (config or {}).get("fallback_model") or "gemini-3.1-flash-live-preview"
 
     logger.info(f"Using Gemini model={model_id}, voice={voice}")
 
@@ -276,6 +276,7 @@ async def entrypoint(ctx: JobContext) -> None:
             voice=voice,
             api_key=os.environ["GOOGLE_API_KEY"],
             instructions=assistant.instructions,
+            thinking_level="minimal",
         )
     except Exception as e:
         logger.warning(f"Primary model {model_id} failed ({e}), trying fallback {fallback_id}")

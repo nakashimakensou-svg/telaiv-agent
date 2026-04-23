@@ -113,7 +113,7 @@ async def run_conversation(
     greeting = greeting_tmpl.replace("{company}", company)
     system_prompt = (config or {}).get("system_prompt") or DEFAULT_SYSTEM_PROMPT
     escalation_kw = (config or {}).get("escalation_keywords") or DEFAULT_ESCALATION_KEYWORDS
-    voice = (config or {}).get("voice") or "Puck"
+    voice = (config or {}).get("voice") or "Zephyr"
 
     full_instructions = (
         f"{system_prompt}\n"
@@ -153,6 +153,16 @@ async def run_conversation(
                     voice_name=voice,
                 )
             )
+        ),
+        realtime_input_config=genai_types.RealtimeInputConfig(
+            # 話し始めたら即座にAI発話を中断する
+            activity_handling=genai_types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+            automatic_activity_detection=genai_types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=genai_types.StartSensitivity.START_SENSITIVITY_HIGH,
+                end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_HIGH,
+                prefix_padding_ms=200,   # 発話開始を確定するまでの時間(ms) — 小さいほど敏感
+                silence_duration_ms=400, # 発話終了を確定するまでの無音時間(ms)
+            ),
         ),
     )
 
@@ -269,14 +279,19 @@ async def run_conversation(
             logger.info(f"play_audio: ended (played={played})")
 
     async def trigger_greeting(session):
-        """receive_audio が起動してから無音を送り、Gemini に挨拶を促す"""
-        await asyncio.sleep(0.3)
-        # 200ms の無音 PCM (16kHz, 16bit, mono)
-        silence = bytes(SEND_SAMPLE_RATE * CHANNELS * 2 * 2 // 10)
-        await session.send_realtime_input(
-            audio={"data": silence, "mime_type": "audio/pcm"}
-        )
-        logger.info("trigger_greeting: silence sent to prompt Gemini greeting")
+        """receive_audio が起動してから send_client_content で挨拶を指示する"""
+        await asyncio.sleep(0.5)  # receive_audio ループが確実に起動するのを待つ
+        try:
+            await session.send_client_content(
+                turns=genai_types.Content(
+                    role="user",
+                    parts=[genai_types.Part(text="こんにちは")],
+                ),
+                turn_complete=True,
+            )
+            logger.info("trigger_greeting: send_client_content sent")
+        except Exception:
+            logger.error("trigger_greeting: send_client_content failed", exc_info=True)
 
     # ── セッション確立 + タスク実行 ─────────────────────────────────────────
 

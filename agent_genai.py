@@ -666,9 +666,10 @@ async def run_conversation(
             for t in pending:
                 t.cancel()
                 try:
-                    await t
-                except (asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(asyncio.shield(t), timeout=3.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
+            logger.info("run_conversation: all tasks cancelled, exiting session")
 
     except Exception:
         logger.error("run_conversation: session error", exc_info=True)

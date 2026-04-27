@@ -592,6 +592,7 @@ async def run_conversation(
 
     transcript: list[dict] = []
     escalated = False
+    recording_url: Optional[str] = None
 
     # Queue: Gemini → LiveKit (PCM bytes at 24kHz)
     audio_in_queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -858,23 +859,38 @@ async def run_conversation(
                     pass
             logger.info("run_conversation: all tasks cancelled, exiting session")
 
+    except asyncio.CancelledError:
+        # LiveKit フレームワークによるキャンセル — re-raise せず finally で後処理を完走させる
+        logger.info("run_conversation: CancelledError caught, running cleanup in finally")
     except Exception:
         logger.error("run_conversation: session error", exc_info=True)
-
-    outcome = "escalated" if escalated else ("resolved" if transcript else "abandoned")
-    logger.info(
-        f"run_conversation: done outcome={outcome} "
-        f"caller_chunks={len(caller_chunks)} ai_chunks={len(ai_chunks)}"
-    )
-
-    # ルーム切断後もここは確実に実行される（entrypoint のキャンセルより前）
-    recording_url = await save_recording(
-        caller_chunks=caller_chunks,
-        ai_chunks=ai_chunks,
-        config=config,
-        room_name=ctx.room.name,
-        telnyx_call_id=telnyx_call_id,
-    )
+    finally:
+        outcome = "escalated" if escalated else ("resolved" if transcript else "abandoned")
+        logger.info(
+            f"run_conversation: done outcome={outcome} "
+            f"caller_chunks={len(caller_chunks)} ai_chunks={len(ai_chunks)}"
+        )
+        # save_recording と post_call_analysis は disconnect/cancel どちらでも必ず実行
+        try:
+            recording_url = await save_recording(
+                caller_chunks=caller_chunks,
+                ai_chunks=ai_chunks,
+                config=config,
+                room_name=ctx.room.name,
+                telnyx_call_id=telnyx_call_id,
+            )
+        except Exception:
+            logger.error("run_conversation: save_recording in finally failed", exc_info=True)
+        try:
+            await post_call_analysis(
+                transcript=transcript,
+                config=config,
+                telnyx_call_id=telnyx_call_id,
+                livekit_room_id=ctx.room.name,
+                recording_url=recording_url,
+            )
+        except Exception:
+            logger.error("run_conversation: post_call_analysis in finally failed", exc_info=True)
 
     return transcript, outcome, recording_url
 
@@ -954,15 +970,7 @@ async def entrypoint(ctx: JobContext) -> None:
         duration_seconds=duration,
         livekit_room_id=ctx.room.name,
     )
-
-    # 通話後分析（Claude API）— save_ai_conversation の後に実行
-    await post_call_analysis(
-        transcript=transcript,
-        config=config,
-        telnyx_call_id=telnyx_call_id,
-        livekit_room_id=ctx.room.name,
-        recording_url=recording_url,
-    )
+    # post_call_analysis は run_conversation の finally ブロックで実行済み
     logger.info(f"Job completed: outcome={outcome} duration={duration}s")
 
 

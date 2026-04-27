@@ -401,18 +401,26 @@ async def _notify_slack(message: str) -> None:
     """Slack Webhook に非同期通知する（fire-and-forget 想定）"""
     webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
     if not webhook_url:
-        logger.warning("SLACK_WEBHOOK_URL not set, skipping Slack notification")
+        logger.warning("_notify_slack: SLACK_WEBHOOK_URL not set")
         return
     try:
         async with aiohttp.ClientSession() as session:
-            await session.post(
+            async with session.post(
                 webhook_url,
                 json={"text": message},
                 timeout=aiohttp.ClientTimeout(total=5),
-            )
-        logger.info(f"_notify_slack: sent ({message[:80]!r})")
+            ) as resp:
+                status = resp.status
+                body = await resp.text()
+                if status == 200:
+                    logger.info(f"_notify_slack: sent status=200 ({message[:80]!r})")
+                else:
+                    logger.error(
+                        f"_notify_slack: FAILED status={status} body={body!r} "
+                        f"url={webhook_url[:50]}..."
+                    )
     except Exception:
-        logger.error("_notify_slack: failed", exc_info=True)
+        logger.error("_notify_slack: exception", exc_info=True)
 
 
 def _update_call_log_ai_summary_sync(telnyx_call_id: str, ai_summary: dict) -> None:

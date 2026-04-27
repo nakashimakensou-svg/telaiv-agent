@@ -44,11 +44,6 @@ FILTER_KEYWORDS = [
 ]
 # 時間外緊急対応キーワード
 EMERGENCY_KEYWORDS = ["雨漏り", "水漏れ", "緊急", "事故"]
-# リアルタイム クレーム検知キーワード（発信者発話に含まれた場合に即アラート）
-CLAIM_KEYWORDS = [
-    "クレーム", "怒", "ふざけるな", "訴える",
-    "責任者", "上の者", "最悪", "絶対許さない",
-]
 
 DEFAULT_GREETING = "はい、お電話ありがとうございます。"
 DEFAULT_ESCALATION_KEYWORDS = ["クレーム", "担当者", "責任者", "上の者", "社長"]
@@ -445,39 +440,47 @@ def _update_ai_conversation_sync(
         .execute()
 
 
-async def analyze_sentiment_with_claude(
+async def post_call_analysis(
     transcript: list[dict],
     config: Optional[dict],
     telnyx_call_id: Optional[str],
     livekit_room_id: str,
+    recording_url: Optional[str],
 ) -> Optional[dict]:
-    """通話後に Claude API で感情・クレーム分析し call_logs.ai_summary を更新する"""
+    """通話後に Claude API で会話全文を分析し、要対応の場合に Slack 通知する。
+    - call_logs.ai_summary (JSONB) を更新
+    - ai_conversations.sentiment + ai_summary を更新
+    - sentiment が negative/angry、または is_complaint=True なら Slack 通知
+    """
     if not transcript:
-        logger.info("analyze_sentiment_with_claude: no transcript, skipping")
+        logger.info("post_call_analysis: no transcript, skipping")
         return None
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        logger.warning("ANTHROPIC_API_KEY not set, skipping sentiment analysis")
+        logger.warning("post_call_analysis: ANTHROPIC_API_KEY not set, skipping")
         return None
 
     lines = [
-        f"[{'発信者' if t['role'] == 'caller' else 'AI受付'}] {t['text']}"
+        f"{'発信者' if t['role'] == 'caller' else 'AI'}: {t['text']}"
         for t in transcript if t.get("text")
     ]
     if not lines:
+        logger.info("post_call_analysis: transcript has no text, skipping")
         return None
 
+    conversation_text = "\n".join(lines)
     prompt = (
-        "以下は電話の会話記録です。JSONのみを返してください（説明文・コードブロック不要）。\n\n"
-        f"会話記録:\n{chr(10).join(lines)}\n\n"
-        "出力フォーマット:\n"
+        "以下は電話の会話記録です。発信者の感情・意図を分析してください。\n\n"
+        f"【会話記録】\n{conversation_text}\n\n"
+        "以下のJSON形式で回答してください（他の文字は不要）：\n"
         '{\n'
-        '  "summary": "会話の要約（2〜3文）",\n'
-        '  "sentiment": "positive" または "neutral" または "negative",\n'
-        '  "complaint_level": 0から100の整数（0=クレームなし、100=激怒）,\n'
+        '  "sentiment": "positive" | "neutral" | "negative" | "angry",\n'
+        '  "is_complaint": true | false,\n'
+        '  "urgency": "low" | "medium" | "high",\n'
+        '  "summary": "会話の要約（1〜2文）",\n'
+        '  "action_required": "対応が必要な場合の内容、不要なら空文字",\n'
         '  "keywords": ["重要キーワード"],\n'
-        '  "action_items": ["要対応事項"],\n'
-        '  "call_type": "inquiry" または "complaint" または "appointment" または "other"\n'
+        '  "call_type": "inquiry" | "complaint" | "appointment" | "other"\n'
         '}'
     )
 
@@ -493,7 +496,7 @@ async def analyze_sentiment_with_claude(
                 },
                 json={
                     "model": "claude-sonnet-4-6",
-                    "max_tokens": 1024,
+                    "max_tokens": 500,
                     "messages": [{"role": "user", "content": prompt}],
                 },
                 timeout=aiohttp.ClientTimeout(total=30),
@@ -502,20 +505,23 @@ async def analyze_sentiment_with_claude(
 
         content = data.get("content", [])
         if not content:
-            logger.error("analyze_sentiment_with_claude: empty Claude response")
+            logger.error("post_call_analysis: empty Claude response")
             return None
         raw_text = content[0].get("text", "").strip()
         result: dict = json.loads(raw_text)
 
         logger.info(
-            f"analyze_sentiment_with_claude: "
-            f"sentiment={result.get('sentiment')} "
-            f"complaint_level={result.get('complaint_level')}"
+            f"post_call_analysis: sentiment={result.get('sentiment')} "
+            f"is_complaint={result.get('is_complaint')} "
+            f"urgency={result.get('urgency')}"
         )
+
+        # call_logs.ai_summary 更新
         if telnyx_call_id:
             await asyncio.to_thread(
                 _update_call_log_ai_summary_sync, telnyx_call_id, result
             )
+        # ai_conversations 更新
         if livekit_room_id:
             await asyncio.to_thread(
                 _update_ai_conversation_sync,
@@ -523,14 +529,29 @@ async def analyze_sentiment_with_claude(
                 result.get("sentiment", "neutral"),
                 result.get("summary", ""),
             )
+
+        # negative/angry または is_complaint=True の場合のみ Slack 通知
+        sentiment = result.get("sentiment", "neutral")
+        is_complaint = result.get("is_complaint", False)
+        if sentiment in ("negative", "angry") or is_complaint:
+            urgency = result.get("urgency", "medium")
+            urgency_emoji = {"low": "🟡", "medium": "🟠", "high": "🔴"}.get(urgency, "⚠️")
+            recording_line = f"録音: {recording_url}" if recording_url else "録音: なし"
+            message = (
+                f"{urgency_emoji} *要対応の電話がありました*\n"
+                f"感情: {sentiment} | 緊急度: {urgency}\n"
+                f"概要: {result.get('summary', '')}\n"
+                f"対応内容: {result.get('action_required') or 'なし'}\n"
+                f"{recording_line}"
+            )
+            await _notify_slack(message)
+
         return result
     except json.JSONDecodeError:
-        logger.error(
-            f"analyze_sentiment_with_claude: JSON parse error raw={raw_text!r}"
-        )
+        logger.error(f"post_call_analysis: JSON parse error raw={raw_text!r}")
         return None
     except Exception:
-        logger.error("analyze_sentiment_with_claude: failed", exc_info=True)
+        logger.error("post_call_analysis: failed", exc_info=True)
         return None
 
 
@@ -544,7 +565,7 @@ async def run_conversation(
     caller_chunks: list[bytes],      # OUT: listen_audio が 16kHz PCM を蓄積
     ai_chunks: list[bytes],          # OUT: receive_audio が 24kHz PCM を蓄積
     telnyx_call_id: Optional[str],   # call_logs 更新用
-) -> tuple[list[dict], str]:
+) -> tuple[list[dict], str, Optional[str]]:
 
     company = (config or {}).get("company_name") or "中島建装"
     greeting_tmpl = (config or {}).get("greeting_template") or DEFAULT_GREETING
@@ -682,7 +703,6 @@ async def run_conversation(
         nonlocal escalated
         logger.info("receive_audio: started")
         total_chunks = 0
-        claim_alerted = False  # クレームアラート送信済みフラグ（1通話1回限り）
         try:
             while True:
                 _flush_evt.clear()  # 新しいターン開始: フラッシュ解除
@@ -697,7 +717,7 @@ async def run_conversation(
                         is_interrupted = True
                         logger.info("receive_audio: interrupted by user speech")
 
-                    # input_transcription: 発信者の音声テキスト変換 + クレーム検知
+                    # input_transcription: 発信者の音声テキスト変換（通話後Claude分析に使用）
                     if sc:
                         input_trans = getattr(sc, "input_transcription", None)
                         if input_trans:
@@ -709,20 +729,6 @@ async def run_conversation(
                                     "text": caller_text,
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                 })
-                                for kw in CLAIM_KEYWORDS:
-                                    if kw in caller_text and not claim_alerted:
-                                        claim_alerted = True
-                                        logger.warning(
-                                            f"sentiment_alert: クレーム検知 "
-                                            f"keyword={kw!r} text={caller_text!r}"
-                                        )
-                                        asyncio.create_task(_notify_slack(
-                                            f"⚠️ *クレーム検知*\n"
-                                            f"キーワード: 「{kw}」\n"
-                                            f"発言: {caller_text}\n"
-                                            f"担当会社: {company}"
-                                        ))
-                                        break
 
                     # response.data: 24kHz PCM バイト列 (inline_data shortcut)
                     if response.data:
@@ -862,7 +868,7 @@ async def run_conversation(
     )
 
     # ルーム切断後もここは確実に実行される（entrypoint のキャンセルより前）
-    await save_recording(
+    recording_url = await save_recording(
         caller_chunks=caller_chunks,
         ai_chunks=ai_chunks,
         config=config,
@@ -870,7 +876,7 @@ async def run_conversation(
         telnyx_call_id=telnyx_call_id,
     )
 
-    return transcript, outcome
+    return transcript, outcome, recording_url
 
 
 # ─── Entrypoint ────────────────────────────────────────────────────────────
@@ -933,7 +939,7 @@ async def entrypoint(ctx: JobContext) -> None:
     ai_chunks: list[bytes] = []
 
     # save_recording は run_conversation 内で呼ばれる（ルーム切断前に確実に実行するため）
-    transcript, outcome = await run_conversation(
+    transcript, outcome, recording_url = await run_conversation(
         ctx, config, audio_source, audio_track,
         caller_chunks=caller_chunks,
         ai_chunks=ai_chunks,
@@ -949,12 +955,13 @@ async def entrypoint(ctx: JobContext) -> None:
         livekit_room_id=ctx.room.name,
     )
 
-    # 通話後感情分析（Claude API）— save_ai_conversation の後に実行
-    await analyze_sentiment_with_claude(
+    # 通話後分析（Claude API）— save_ai_conversation の後に実行
+    await post_call_analysis(
         transcript=transcript,
         config=config,
         telnyx_call_id=telnyx_call_id,
         livekit_room_id=ctx.room.name,
+        recording_url=recording_url,
     )
     logger.info(f"Job completed: outcome={outcome} duration={duration}s")
 

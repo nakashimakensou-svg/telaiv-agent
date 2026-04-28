@@ -515,7 +515,14 @@ async def post_call_analysis(
             return None
         raw_text = content[0].get("text", "").strip()
         logger.info(f"post_call_analysis: raw Claude text={raw_text[:200]!r}")
-        result: dict = json.loads(raw_text)
+        clean_text = (
+            raw_text
+            .removeprefix("```json")
+            .removeprefix("```")
+            .removesuffix("```")
+            .strip()
+        )
+        result: dict = json.loads(clean_text)
 
         logger.info(
             f"post_call_analysis: sentiment={result.get('sentiment')} "

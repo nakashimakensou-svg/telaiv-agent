@@ -575,7 +575,8 @@ async def run_conversation(
     caller_chunks: list[bytes],      # OUT: listen_audio が 16kHz PCM を蓄積
     ai_chunks: list[bytes],          # OUT: receive_audio が 24kHz PCM を蓄積
     telnyx_call_id: Optional[str],   # call_logs 更新用
-) -> tuple[list[dict], str, Optional[str]]:
+    transcript: list[dict],          # OUT: entrypoint が作成した共有リスト（in-place 蓄積）
+) -> str:                            # outcome のみ返す
 
     company = (config or {}).get("company_name") or "中島建装"
     greeting_tmpl = (config or {}).get("greeting_template") or DEFAULT_GREETING
@@ -600,9 +601,7 @@ async def run_conversation(
         f"「{greeting}」"
     )
 
-    transcript: list[dict] = []
     escalated = False
-    recording_url: Optional[str] = None
 
     # Queue: Gemini → LiveKit (PCM bytes at 24kHz)
     audio_in_queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -879,43 +878,12 @@ async def run_conversation(
         outcome = "escalated" if escalated else ("resolved" if transcript else "abandoned")
         logger.info(
             f"run_conversation: done outcome={outcome} "
-            f"caller_chunks={len(caller_chunks)} ai_chunks={len(ai_chunks)}"
+            f"caller_chunks={len(caller_chunks)} ai_chunks={len(ai_chunks)} "
+            f"transcript_len={len(transcript)}"
         )
-        # save_recording と post_call_analysis は disconnect/cancel どちらでも必ず実行
-        try:
-            recording_url = await save_recording(
-                caller_chunks=caller_chunks,
-                ai_chunks=ai_chunks,
-                config=config,
-                room_name=ctx.room.name,
-                telnyx_call_id=telnyx_call_id,
-            )
-        except Exception:
-            logger.error("run_conversation: save_recording in finally failed", exc_info=True)
+        # save_recording / post_call_analysis は on_shutdown フックで実行
 
-        transcript_len = len(transcript)
-        url_preview = (recording_url[:60] if recording_url else "none")
-        logger.info(
-            f"post_call_analysis: starting "
-            f"(transcript_len={transcript_len}, recording_url={url_preview})"
-        )
-        if transcript_len == 0:
-            logger.warning(
-                "post_call_analysis: transcript is empty — "
-                "input_transcription が届いていないか agent text が未取得の可能性あり"
-            )
-        try:
-            await post_call_analysis(
-                transcript=transcript,
-                config=config,
-                telnyx_call_id=telnyx_call_id,
-                livekit_room_id=ctx.room.name,
-                recording_url=recording_url,
-            )
-        except Exception:
-            logger.error("run_conversation: post_call_analysis in finally failed", exc_info=True)
-
-    return transcript, outcome, recording_url
+    return outcome
 
 
 # ─── Entrypoint ────────────────────────────────────────────────────────────
@@ -976,13 +944,58 @@ async def entrypoint(ctx: JobContext) -> None:
 
     caller_chunks: list[bytes] = []
     ai_chunks: list[bytes] = []
+    transcript: list[dict] = []      # run_conversation が in-place で蓄積する共有リスト
 
-    # save_recording は run_conversation 内で呼ばれる（ルーム切断前に確実に実行するため）
-    transcript, outcome, recording_url = await run_conversation(
+    # LiveKit がプロセス終了前に呼ぶシャットダウンフック
+    # （finally ブロックが実行されない強制終了でも録音・分析を保証する）
+    async def on_shutdown() -> None:
+        logger.info(
+            f"on_shutdown: triggered "
+            f"(caller_chunks={len(caller_chunks)}, ai_chunks={len(ai_chunks)}, "
+            f"transcript_len={len(transcript)})"
+        )
+        rec_url: Optional[str] = None
+        try:
+            rec_url = await save_recording(
+                caller_chunks=caller_chunks,
+                ai_chunks=ai_chunks,
+                config=config,
+                room_name=ctx.room.name,
+                telnyx_call_id=telnyx_call_id,
+            )
+        except Exception:
+            logger.error("on_shutdown: save_recording failed", exc_info=True)
+
+        transcript_len = len(transcript)
+        url_preview = rec_url[:60] if rec_url else "none"
+        logger.info(
+            f"on_shutdown: post_call_analysis starting "
+            f"(transcript_len={transcript_len}, recording_url={url_preview})"
+        )
+        if transcript_len == 0:
+            logger.warning(
+                "on_shutdown: transcript empty — "
+                "input_transcription 未取得か agent text が収集されていない可能性あり"
+            )
+        try:
+            await post_call_analysis(
+                transcript=transcript,
+                config=config,
+                telnyx_call_id=telnyx_call_id,
+                livekit_room_id=ctx.room.name,
+                recording_url=rec_url,
+            )
+        except Exception:
+            logger.error("on_shutdown: post_call_analysis failed", exc_info=True)
+
+    ctx.add_shutdown_callback(on_shutdown)
+
+    outcome = await run_conversation(
         ctx, config, audio_source, audio_track,
         caller_chunks=caller_chunks,
         ai_chunks=ai_chunks,
         telnyx_call_id=telnyx_call_id,
+        transcript=transcript,
     )
 
     duration = int((datetime.now(timezone.utc) - start_time).total_seconds())
@@ -993,7 +1006,6 @@ async def entrypoint(ctx: JobContext) -> None:
         duration_seconds=duration,
         livekit_room_id=ctx.room.name,
     )
-    # post_call_analysis は run_conversation の finally ブロックで実行済み
     logger.info(f"Job completed: outcome={outcome} duration={duration}s")
 
 

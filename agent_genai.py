@@ -875,6 +875,7 @@ async def run_conversation(
     except Exception:
         logger.error("run_conversation: session error", exc_info=True)
     finally:
+        logger.info("run_conversation: finally block executing")
         outcome = "escalated" if escalated else ("resolved" if transcript else "abandoned")
         logger.info(
             f"run_conversation: done outcome={outcome} "

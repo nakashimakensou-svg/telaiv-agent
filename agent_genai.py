@@ -484,6 +484,10 @@ async def post_call_analysis(
         '}'
     )
 
+    logger.info(
+        f"post_call_analysis: calling Claude API "
+        f"(lines={len(lines)}, model=claude-sonnet-4-6)"
+    )
     raw_text = ""
     try:
         async with aiohttp.ClientSession() as session:
@@ -501,13 +505,16 @@ async def post_call_analysis(
                 },
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
+                http_status = resp.status
                 data = await resp.json()
+                logger.info(f"post_call_analysis: Claude API responded status={http_status}")
 
         content = data.get("content", [])
         if not content:
-            logger.error("post_call_analysis: empty Claude response")
+            logger.error(f"post_call_analysis: empty Claude response data={data!r}")
             return None
         raw_text = content[0].get("text", "").strip()
+        logger.info(f"post_call_analysis: raw Claude text={raw_text[:200]!r}")
         result: dict = json.loads(raw_text)
 
         logger.info(
@@ -550,8 +557,11 @@ async def post_call_analysis(
     except json.JSONDecodeError:
         logger.error(f"post_call_analysis: JSON parse error raw={raw_text!r}")
         return None
-    except Exception:
-        logger.error("post_call_analysis: failed", exc_info=True)
+    except Exception as e:
+        logger.error(
+            f"post_call_analysis: FAILED type={type(e).__name__} msg={e}",
+            exc_info=True,
+        )
         return None
 
 

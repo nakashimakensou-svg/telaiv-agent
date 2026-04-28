@@ -881,6 +881,18 @@ async def run_conversation(
             )
         except Exception:
             logger.error("run_conversation: save_recording in finally failed", exc_info=True)
+
+        transcript_len = len(transcript)
+        url_preview = (recording_url[:60] if recording_url else "none")
+        logger.info(
+            f"post_call_analysis: starting "
+            f"(transcript_len={transcript_len}, recording_url={url_preview})"
+        )
+        if transcript_len == 0:
+            logger.warning(
+                "post_call_analysis: transcript is empty — "
+                "input_transcription が届いていないか agent text が未取得の可能性あり"
+            )
         try:
             await post_call_analysis(
                 transcript=transcript,

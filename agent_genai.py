@@ -572,6 +572,162 @@ async def post_call_analysis(
         return None
 
 
+# ─── リピーター認識ユーティリティ ──────────────────────────────────────────────
+
+async def get_caller_context(phone_number: Optional[str]) -> str:
+    """発信者情報を Supabase から取得してシステムプロンプト用テキストを返す"""
+    if not phone_number:
+        return ""
+    supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not supabase_url or not supabase_key:
+        return ""
+    headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{supabase_url}/rest/v1/callers",
+                params={"phone_number": f"eq.{phone_number}", "limit": "1"},
+                headers=headers,
+            ) as resp:
+                callers = await resp.json()
+
+            if not callers:
+                logger.info(f"get_caller_context: new caller {phone_number}")
+                return ""
+
+            caller = callers[0]
+
+            async with session.get(
+                f"{supabase_url}/rest/v1/call_memories",
+                params={
+                    "phone_number": f"eq.{phone_number}",
+                    "order": "called_at.desc",
+                    "limit": "3",
+                },
+                headers=headers,
+            ) as resp:
+                memories = await resp.json()
+
+        lines = ["【発信者情報】"]
+        if caller.get("company_name"):
+            lines.append(f"会社名: {caller['company_name']}")
+        if caller.get("contact_name"):
+            lines.append(f"担当者名: {caller['contact_name']}")
+        lines.append(f"過去の通話回数: {caller['call_count']}回")
+        if caller.get("last_sentiment"):
+            lines.append(f"前回の感情: {caller['last_sentiment']}")
+        if caller.get("memo"):
+            lines.append(f"メモ: {caller['memo']}")
+        if memories:
+            lines.append("【直近の通話履歴】")
+            for m in memories:
+                date = (m.get("called_at") or "")[:10]
+                lines.append(
+                    f"- {date}: {m.get('summary', '記録なし')} "
+                    f"(感情:{m.get('sentiment', '-')})"
+                )
+
+        context = "\n".join(lines)
+        logger.info(
+            f"get_caller_context: found caller={phone_number} "
+            f"call_count={caller['call_count']}"
+        )
+        return context
+    except Exception:
+        logger.error("get_caller_context: error", exc_info=True)
+        return ""
+
+
+async def save_caller_memory(
+    phone_number: str,
+    analysis: dict,
+    recording_url: Optional[str],
+    duration_seconds: int,
+    transcript: list[dict],
+) -> None:
+    """通話結果を callers / call_memories テーブルに upsert / insert する"""
+    supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not supabase_url or not supabase_key:
+        logger.warning("save_caller_memory: SUPABASE_URL or KEY not set")
+        return
+
+    base_headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+    }
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # 既存レコードを取得して call_count をインクリメント
+            async with session.get(
+                f"{supabase_url}/rest/v1/callers",
+                params={"phone_number": f"eq.{phone_number}", "limit": "1"},
+                headers=base_headers,
+            ) as resp:
+                existing = await resp.json()
+
+            new_count = (existing[0]["call_count"] if existing else 0) + 1
+
+            caller_data = {
+                "phone_number": phone_number,
+                "call_count": new_count,
+                "last_called_at": now_iso,
+                "last_sentiment": analysis.get("sentiment"),
+                "last_summary": analysis.get("summary"),
+                "updated_at": now_iso,
+            }
+
+            async with session.post(
+                f"{supabase_url}/rest/v1/callers",
+                json=caller_data,
+                headers={
+                    **base_headers,
+                    "Prefer": "resolution=merge-duplicates,return=representation",
+                },
+            ) as resp:
+                upserted = await resp.json()
+                caller_id = upserted[0]["id"] if upserted else None
+                logger.info(
+                    f"save_caller_memory: callers upserted "
+                    f"call_count={new_count} caller_id={caller_id}"
+                )
+
+            if not caller_id:
+                logger.error("save_caller_memory: caller_id is None, skipping call_memories")
+                return
+
+            transcript_text = "\n".join(
+                f"{t['role']}: {t['text']}"
+                for t in transcript if t.get("text")
+            )
+            memory_data = {
+                "caller_id": caller_id,
+                "phone_number": phone_number,
+                "called_at": now_iso,
+                "duration_seconds": duration_seconds,
+                "sentiment": analysis.get("sentiment"),
+                "urgency": analysis.get("urgency"),
+                "summary": analysis.get("summary"),
+                "action_required": analysis.get("action_required"),
+                "recording_url": recording_url,
+                "transcript": transcript_text,
+            }
+            async with session.post(
+                f"{supabase_url}/rest/v1/call_memories",
+                json=memory_data,
+                headers=base_headers,
+            ) as resp:
+                logger.info(
+                    f"save_caller_memory: call_memories inserted status={resp.status}"
+                )
+    except Exception:
+        logger.error("save_caller_memory: error", exc_info=True)
+
+
 # ─── Conversation bridge ────────────────────────────────────────────────────
 
 async def run_conversation(
@@ -582,6 +738,7 @@ async def run_conversation(
     caller_chunks: list[bytes],      # OUT: listen_audio が 16kHz PCM を蓄積
     ai_chunks: list[bytes],          # OUT: receive_audio が 24kHz PCM を蓄積
     telnyx_call_id: Optional[str],   # call_logs 更新用
+    caller_number: Optional[str],    # 発信者番号（リピーター認識用）
     transcript: list[dict],          # OUT: entrypoint が作成した共有リスト（in-place 蓄積）
 ) -> str:                            # outcome のみ返す
 
@@ -607,6 +764,15 @@ async def run_conversation(
         f"【重要】会話が始まったら、ユーザーの発言を待たずに即座に次のセリフで挨拶してください:\n"
         f"「{greeting}」"
     )
+
+    # 発信者の過去情報をシステムプロンプトに注入（リピーター認識）
+    caller_context = await get_caller_context(caller_number)
+    if caller_context:
+        full_instructions += (
+            f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{caller_context}\n\n"
+            f"【重要】過去の通話回数が1回以上の場合、最初の挨拶で「以前もお電話いただきありがとうございます」と自然に触れてください。"
+        )
 
     escalated = False
 
@@ -902,10 +1068,12 @@ async def entrypoint(ctx: JobContext) -> None:
     start_time = datetime.now(timezone.utc)
 
     called_number: Optional[str] = None
+    caller_number: Optional[str] = None
     telnyx_call_id: Optional[str] = None
     try:
         room_meta = json.loads(ctx.room.metadata or "{}")
         called_number  = room_meta.get("called_number") or room_meta.get("to")
+        caller_number  = room_meta.get("caller_number") or room_meta.get("from")
         telnyx_call_id = room_meta.get("telnyx_call_id") or room_meta.get("call_control_id")
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -918,10 +1086,16 @@ async def entrypoint(ctx: JobContext) -> None:
                 or attrs.get("sip.trunkPhoneNumber")
                 or attrs.get("called_number")
             )
+            if not caller_number:
+                caller_number = (
+                    attrs.get("sip.from")
+                    or attrs.get("sip.phoneNumber")
+                    or attrs.get("caller_number")
+                )
             if called_number:
                 break
 
-    logger.info(f"called_number={called_number}")
+    logger.info(f"called_number={called_number} caller_number={caller_number}")
     config = await get_concierge_config(called_number) if called_number else None
 
     # AudioSource は Gemini の出力サンプルレート (24kHz) で作成
@@ -984,8 +1158,9 @@ async def entrypoint(ctx: JobContext) -> None:
                 "on_shutdown: transcript empty — "
                 "input_transcription 未取得か agent text が収集されていない可能性あり"
             )
+        analysis: Optional[dict] = None
         try:
-            await post_call_analysis(
+            analysis = await post_call_analysis(
                 transcript=transcript,
                 config=config,
                 telnyx_call_id=telnyx_call_id,
@@ -995,6 +1170,20 @@ async def entrypoint(ctx: JobContext) -> None:
         except Exception:
             logger.error("on_shutdown: post_call_analysis failed", exc_info=True)
 
+        # リピーター情報を保存（caller_number が取れている場合のみ）
+        if caller_number and analysis:
+            duration_sec = int((datetime.now(timezone.utc) - start_time).total_seconds())
+            try:
+                await save_caller_memory(
+                    phone_number=caller_number,
+                    analysis=analysis,
+                    recording_url=rec_url,
+                    duration_seconds=duration_sec,
+                    transcript=transcript,
+                )
+            except Exception:
+                logger.error("on_shutdown: save_caller_memory failed", exc_info=True)
+
     ctx.add_shutdown_callback(on_shutdown)
 
     outcome = await run_conversation(
@@ -1002,6 +1191,7 @@ async def entrypoint(ctx: JobContext) -> None:
         caller_chunks=caller_chunks,
         ai_chunks=ai_chunks,
         telnyx_call_id=telnyx_call_id,
+        caller_number=caller_number,
         transcript=transcript,
     )
 

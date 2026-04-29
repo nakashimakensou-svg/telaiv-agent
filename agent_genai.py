@@ -446,6 +446,7 @@ async def post_call_analysis(
     telnyx_call_id: Optional[str],
     livekit_room_id: str,
     recording_url: Optional[str],
+    caller_number: Optional[str] = None,
 ) -> Optional[dict]:
     """通話後に Claude API で会話全文を分析し、要対応の場合に Slack 通知する。
     - call_logs.ai_summary (JSONB) を更新
@@ -559,6 +560,16 @@ async def post_call_analysis(
                 f"{recording_line}"
             )
             await _notify_slack(message)
+
+            notify_sms = os.environ.get("NOTIFY_SMS_TO")
+            if notify_sms:
+                from sms import format_complaint_sms, send_sms
+                sms_text = format_complaint_sms(
+                    phone_number=caller_number or "不明",
+                    summary=result.get("summary", ""),
+                    urgency=urgency,
+                )
+                await send_sms(notify_sms, sms_text)
 
         return result
     except json.JSONDecodeError:
@@ -1166,6 +1177,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 telnyx_call_id=telnyx_call_id,
                 livekit_room_id=ctx.room.name,
                 recording_url=rec_url,
+                caller_number=caller_number,
             )
         except Exception:
             logger.error("on_shutdown: post_call_analysis failed", exc_info=True)

@@ -261,6 +261,18 @@ async def build_and_send_report(target_date: datetime) -> None:
     )
 
     await send_slack(message)
+
+    notify_sms = os.environ.get("NOTIFY_SMS_TO")
+    if notify_sms:
+        from sms import format_daily_report_sms, send_sms
+        sms_text = format_daily_report_sms(
+            date_label=date_label,
+            total=total,
+            angry_count=angry_count,
+            unresponded_count=len(unresponded),
+        )
+        await send_sms(notify_sms, sms_text)
+
     await _record_sent(date_str)
 
 

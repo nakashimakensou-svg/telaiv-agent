@@ -21,13 +21,22 @@ JST = timezone(timedelta(hours=9))
 
 def _sb_headers() -> dict:
     key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-    return {"apikey": key, "Authorization": f"Bearer {key}"}
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+    }
 
 
 async def _sb_get(session: aiohttp.ClientSession, path: str, params) -> list:
     url = os.environ["SUPABASE_URL"].rstrip("/") + f"/rest/v1/{path}"
     async with session.get(url, params=params, headers=_sb_headers()) as resp:
-        return await resp.json()
+        text = await resp.text()
+        print(f"_sb_get: {path} status={resp.status} body={text[:100]}")
+        if resp.status != 200:
+            return []
+        import json
+        return json.loads(text)
 
 
 async def _sb_post(session: aiohttp.ClientSession, path: str, data: dict) -> None:

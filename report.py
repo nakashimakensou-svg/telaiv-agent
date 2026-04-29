@@ -1,13 +1,9 @@
+from __future__ import annotations
+
 """
 Telaiv 日次通話レポート — Railway Cron から毎朝8時(JST)に実行
 python report.py
 """
-
-import os
-print(f"CWD: {os.getcwd()}")
-print(f"Files: {os.listdir('.')}")
-
-from __future__ import annotations
 
 import asyncio
 import os

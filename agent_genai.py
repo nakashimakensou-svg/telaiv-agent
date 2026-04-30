@@ -571,6 +571,15 @@ async def post_call_analysis(
                 )
                 await send_sms(notify_sms, sms_text)
 
+            # 自動発信: TELNYX_PHONE_NUMBER が設定されている場合のみ有効
+            if os.environ.get("TELNYX_PHONE_NUMBER") and caller_number:
+                from outbound_call import make_alert_call
+                await make_alert_call(
+                    caller_number=caller_number,
+                    summary=result.get("summary", ""),
+                    urgency=urgency,
+                )
+
         return result
     except json.JSONDecodeError:
         logger.error(f"post_call_analysis: JSON parse error raw={raw_text!r}")

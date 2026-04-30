@@ -367,6 +367,20 @@ async def get_concierge_config(called_number: str) -> Optional[dict]:
         return None
 
 
+async def _get_tenant_notify_sms(tenant_id: Optional[str]) -> Optional[str]:
+    """tenants.notify_sms をDBから取得する。取得できない場合は None を返す。"""
+    if not tenant_id:
+        return None
+    try:
+        sb = _get_supabase()
+        res = sb.from_("tenants").select("notify_sms").eq("id", tenant_id).limit(1).execute()
+        if res.data:
+            return res.data[0].get("notify_sms") or None
+    except Exception:
+        logger.error("_get_tenant_notify_sms: error", exc_info=True)
+    return None
+
+
 async def save_ai_conversation(
     config: Optional[dict],
     transcript: list[dict],
@@ -561,23 +575,33 @@ async def post_call_analysis(
             )
             await _notify_slack(message)
 
-            notify_sms = os.environ.get("NOTIFY_SMS_TO")
-            if notify_sms:
+            # SMS/自動発信の送信先: tenant.notify_sms → env fallback の優先順で解決
+            tenant_id = (config or {}).get("tenant_id")
+            notify_to = await _get_tenant_notify_sms(tenant_id)
+            if not notify_to:
+                notify_to = os.environ.get("NOTIFY_SMS_TO")
+            logger.info(
+                f"post_call_analysis: notify_to={notify_to!r} "
+                f"(tenant_id={tenant_id}, from_db={bool(notify_to and tenant_id)})"
+            )
+
+            if notify_to:
                 from sms import format_complaint_sms, send_sms
                 sms_text = format_complaint_sms(
                     phone_number=caller_number or "不明",
                     summary=result.get("summary", ""),
                     urgency=urgency,
                 )
-                await send_sms(notify_sms, sms_text)
+                await send_sms(notify_to, sms_text)
 
             # 自動発信: TELNYX_PHONE_NUMBER が設定されている場合のみ有効
-            if os.environ.get("TELNYX_PHONE_NUMBER") and caller_number:
+            if os.environ.get("TELNYX_PHONE_NUMBER") and caller_number and notify_to:
                 from outbound_call import make_alert_call
                 await make_alert_call(
                     caller_number=caller_number,
                     summary=result.get("summary", ""),
                     urgency=urgency,
+                    to_number=notify_to,
                 )
 
         return result

@@ -17,24 +17,26 @@ async def make_alert_call(
     summary: str,
     urgency: str = "medium",
     caller_name: str = "お客様",
+    to_number: str | None = None,
 ) -> bool:
     """クレーム/緊急検知時によしきさんに自動発信する。
 
     発信フロー:
-    1. Telnyx が NOTIFY_SMS_TO に発信
+    1. Telnyx が to_number（なければ NOTIFY_SMS_TO）に発信
     2. 応答後 → TTS でクレーム概要を読み上げ + DTMF ギャザー
     3. 1 → お客様の番号に転送 / 2 またはタイムアウト → 終話
     """
     api_key = os.environ.get("TELNYX_API_KEY")
     connection_id = os.environ.get("TELNYX_APP_ID")
     from_number = os.environ.get("TELNYX_PHONE_NUMBER")
-    to_number = os.environ.get("NOTIFY_SMS_TO")
+    # to_number 引数優先、なければ env fallback
+    resolved_to = to_number or os.environ.get("NOTIFY_SMS_TO")
     app_url = os.environ.get("NEXT_PUBLIC_APP_URL", "https://www.telaiv.com").rstrip("/")
 
-    if not api_key or not connection_id or not from_number or not to_number:
+    if not api_key or not connection_id or not from_number or not resolved_to:
         logger.warning(
-            "make_alert_call: missing env vars — "
-            "TELNYX_API_KEY / TELNYX_APP_ID / TELNYX_PHONE_NUMBER / NOTIFY_SMS_TO"
+            "make_alert_call: missing config — "
+            "TELNYX_API_KEY / TELNYX_APP_ID / TELNYX_PHONE_NUMBER / notify_sms"
         )
         return False
 
@@ -51,7 +53,7 @@ async def make_alert_call(
 
     payload = {
         "connection_id": connection_id,
-        "to": to_number,
+        "to": resolved_to,
         "from": from_number,
         "webhook_url": f"{app_url}/api/telnyx/outbound-webhook",
         "client_state": client_state,
@@ -72,7 +74,7 @@ async def make_alert_call(
                 if resp.status in (200, 201, 202):
                     cid = body.get("data", {}).get("call_control_id", "")
                     logger.info(
-                        f"make_alert_call: initiated to={to_number} urgency={urgency} "
+                        f"make_alert_call: initiated to={resolved_to} urgency={urgency} "
                         f"call_control_id={cid}"
                     )
                     return True

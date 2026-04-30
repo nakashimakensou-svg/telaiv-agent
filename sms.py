@@ -1,45 +1,38 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
-import aiohttp
-
 logger = logging.getLogger(__name__)
 
-TELNYX_API_URL = "https://api.telnyx.com/v2/messages"
+
+def _get_twilio_client():
+    from twilio.rest import Client
+    sid = os.environ["TWILIO_ACCOUNT_SID"]
+    token = os.environ["TWILIO_AUTH_TOKEN"]
+    return Client(sid, token)
+
+
+def _send_sms_sync(to: str, message: str) -> bool:
+    from_number = os.environ.get("TWILIO_SMS_FROM", "+16504803451")
+    try:
+        client = _get_twilio_client()
+        msg = client.messages.create(body=message, from_=from_number, to=to)
+        logger.info(f"send_sms: sent to={to} sid={msg.sid} status={msg.status}")
+        return True
+    except Exception as e:
+        logger.error(f"send_sms: FAILED to={to} error={e}")
+        return False
 
 
 async def send_sms(to: str, message: str) -> bool:
-    api_key = os.environ.get("TELNYX_API_KEY")
-    from_number = os.environ.get("TELNYX_SMS_FROM")
-
-    if not api_key or not from_number:
-        logger.warning("send_sms: TELNYX_API_KEY or TELNYX_SMS_FROM not set")
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not sid or not token:
+        logger.warning("send_sms: TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set")
         return False
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                TELNYX_API_URL,
-                json={"from": from_number, "to": to, "text": message},
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-            ) as resp:
-                body = await resp.text()
-                if resp.status in (200, 201):
-                    logger.info(f"send_sms: sent to={to} status={resp.status}")
-                    return True
-                else:
-                    logger.error(
-                        f"send_sms: FAILED to={to} status={resp.status} body={body[:100]}"
-                    )
-                    return False
-    except Exception as e:
-        logger.error(f"send_sms: exception {e}")
-        return False
+    return await asyncio.to_thread(_send_sms_sync, to, message)
 
 
 def format_complaint_sms(

@@ -75,7 +75,10 @@ async def sb_patch(session: aiohttp.ClientSession, path: str, match: dict, data:
 async def sb_post(session: aiohttp.ClientSession, path: str, data: dict):
     url = f"{SUPABASE_URL}/rest/v1/{path}"
     async with session.post(url, headers=_sb_headers(), json=data) as resp:
-        resp.raise_for_status()
+        if not resp.ok:
+            body = await resp.text()
+            logger.error(f"sb_post {path}: status={resp.status} body={body} payload={data}")
+            resp.raise_for_status()
         return await resp.json()
 
 
@@ -249,6 +252,7 @@ async def _dial_lead(
             {
                 "campaign_id": campaign["id"],
                 "lead_id": lead["id"],
+                "tenant_id": tenant_id,
                 "telnyx_call_id": room_name,
                 "called_at": datetime.now(timezone.utc).isoformat(),
                 "outcome": "dialing",

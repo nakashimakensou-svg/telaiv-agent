@@ -143,22 +143,28 @@ async def outbound_dial(req: DialRequest):
                     departure_timeout=30,
                 )
             )
+            logger.info(f"[DEBUG] LIVEKIT_SIP_OUTBOUND_TRUNK_ID env value: {trunk_id!r}")
             logger.info(
-                f"create_sip_participant args: trunk_id={trunk_id!r} "
-                f"room={room_name!r} to={req.to_number!r} "
-                f"identity=callee-{req.call_log_id[:8]} wait_until_answered=False"
+                f"[DEBUG] About to call create_sip_participant: "
+                f"trunk_id={trunk_id!r} room={room_name!r} to={req.to_number!r}"
             )
-            result = await lk.sip.create_sip_participant(
-                lkapi.CreateSIPParticipantRequest(
-                    sip_trunk_id=trunk_id,
-                    sip_call_to=req.to_number,
-                    room_name=room_name,
-                    participant_identity=f"callee-{req.call_log_id[:8]}",
-                    participant_name=req.caller_name or req.to_number,
-                    wait_until_answered=False,
+            try:
+                sip_participant = await lk.sip.create_sip_participant(
+                    lkapi.CreateSIPParticipantRequest(
+                        sip_trunk_id=trunk_id,
+                        sip_call_to=req.to_number,
+                        room_name=room_name,
+                        participant_identity=f"callee-{req.call_log_id[:8]}",
+                        participant_name=req.caller_name or req.to_number,
+                        wait_until_answered=False,
+                    )
                 )
-            )
-            logger.info(f"create_sip_participant result: {result}")
+                logger.info(f"[DEBUG] create_sip_participant returned: {sip_participant}")
+            except Exception as sip_exc:
+                logger.exception(
+                    f"[DEBUG] create_sip_participant raised: {type(sip_exc).__name__}: {sip_exc}"
+                )
+                raise
     except Exception as exc:
         msg = str(exc)
         logger.error(f"/outbound/dial: LiveKit error room={room_name}: {msg}", exc_info=True)

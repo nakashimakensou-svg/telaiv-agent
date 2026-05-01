@@ -94,8 +94,17 @@ def _within_schedule(campaign: dict) -> bool:
         )
         return False
 
-    start_str: str = campaign.get("call_hours_start") or "09:00"
-    end_str: str = campaign.get("call_hours_end") or "18:00"
+    # DB raw values をそのままログに出す（None なら fallback していることが分かる）
+    raw_start = campaign.get("call_hours_start")
+    raw_end = campaign.get("call_hours_end")
+    logger.info(
+        f"_within_schedule: DB raw call_hours_start={raw_start!r} call_hours_end={raw_end!r}"
+    )
+
+    # None / 空文字のときは「終日」をデフォルトにする
+    start_str: str = raw_start or "00:00"
+    end_str: str = raw_end or "23:59"
+
     try:
         sh, sm = map(int, start_str[:5].split(":"))
         eh, em = map(int, end_str[:5].split(":"))

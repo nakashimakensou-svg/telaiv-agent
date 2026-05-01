@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY agent.py agent_genai.py report.py sms.py outbound_call.py ./
+COPY agent.py agent_genai.py report.py sms.py outbound_call.py outbound_runner.py outbound_genai.py ./
 
 # silero VAD モデルを事前ダウンロード（コールドスタート対策）
 RUN python -c "from livekit.plugins import silero; silero.VAD.load()" || true

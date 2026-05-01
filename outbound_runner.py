@@ -234,12 +234,6 @@ async def _dial_lead(
                         "retry_count": lead.get("retry_count", 0) + 1,
                     },
                 )
-                # calls_made をインクリメント
-                await sb_patch(
-                    session, "outbound_campaigns",
-                    {"id": campaign["id"]},
-                    {"calls_made": (campaign.get("calls_made") or 0) + 1},
-                )
                 return True
             else:
                 logger.error(f"_dial_lead: FAILED status={resp.status} body={body}")
@@ -344,10 +338,27 @@ async def _process_campaign(session: aiohttp.ClientSession, campaign: dict) -> N
         return
 
     # ── 発信 ─────────────────────────────────────────────────────────────
+    dialed_count = 0
     for lead in leads_to_call:
         success = await _dial_lead(session, campaign, lead, tenant_id)
-        if not success:
+        if success:
+            dialed_count += 1
+        else:
             logger.warning(f"campaign={campaign_id}: dial failed for lead={lead['id']}")
+
+    # calls_made をまとめて加算（ループ内のスナップショット加算を避ける）
+    if dialed_count > 0:
+        current = await sb_get(
+            session,
+            "outbound_campaigns",
+            {"id": f"eq.{campaign_id}", "select": "calls_made"},
+        )
+        base = int((current[0].get("calls_made") or 0) if current else 0)
+        await sb_patch(
+            session, "outbound_campaigns",
+            {"id": campaign_id},
+            {"calls_made": base + dialed_count},
+        )
 
 
 # ── Stale call cleanup ────────────────────────────────────────────────────────

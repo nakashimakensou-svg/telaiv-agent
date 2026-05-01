@@ -20,6 +20,7 @@ import aiohttp
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 load_dotenv()
@@ -34,6 +35,18 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 app = FastAPI(title="Telaiv Dial Server")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://telaiv.com",
+        "https://www.telaiv.com",
+        "https://telaiv.dev",
+        "http://localhost:3000",
+    ],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 
 class DialRequest(BaseModel):

@@ -143,7 +143,12 @@ async def outbound_dial(req: DialRequest):
                     departure_timeout=30,
                 )
             )
-            await lk.sip.create_sip_participant(
+            logger.info(
+                f"create_sip_participant args: trunk_id={trunk_id!r} "
+                f"room={room_name!r} to={req.to_number!r} "
+                f"identity=callee-{req.call_log_id[:8]} wait_until_answered=False"
+            )
+            result = await lk.sip.create_sip_participant(
                 lkapi.CreateSIPParticipantRequest(
                     sip_trunk_id=trunk_id,
                     sip_call_to=req.to_number,
@@ -153,6 +158,7 @@ async def outbound_dial(req: DialRequest):
                     wait_until_answered=False,
                 )
             )
+            logger.info(f"create_sip_participant result: {result}")
     except Exception as exc:
         msg = str(exc)
         logger.error(f"/outbound/dial: LiveKit error room={room_name}: {msg}", exc_info=True)

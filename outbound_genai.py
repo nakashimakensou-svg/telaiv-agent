@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import array
 import asyncio
-import base64
 import io
 import json
 import logging
@@ -335,7 +334,7 @@ async def run_outbound_conversation(ctx: JobContext, client_state: dict) -> None
     lead_id = client_state.get("lead_id", "")
     tenant_id = client_state.get("tenant_id", "")
     script = client_state.get("script", "")
-    call_control_id = client_state.get("call_control_id", "")
+    call_control_id = client_state.get("call_control_id") or client_state.get("room_name", "")
 
     logger.info(
         f"run_outbound_conversation: "
@@ -486,24 +485,12 @@ async def entrypoint(ctx: JobContext) -> None:
     except json.JSONDecodeError:
         meta = {}
 
-    # client_state は LiveKit → agent の job metadata に含まれる
-    # Telnyx SIP → LiveKit の場合は room.sip_attributes か metadata に埋め込む
-    client_state_b64 = meta.get("client_state", "")
-    if not client_state_b64:
-        logger.warning("entrypoint: no client_state in room metadata, skipping")
+    if meta.get("type") != "outbound_sales":
+        logger.info(f"entrypoint: type={meta.get('type')!r} — not outbound_sales, skipping")
         return
 
-    try:
-        client_state = json.loads(base64.b64decode(client_state_b64).decode("utf-8"))
-    except Exception:
-        logger.error("entrypoint: failed to decode client_state", exc_info=True)
-        return
-
-    if client_state.get("type") != "outbound_sales":
-        logger.info(f"entrypoint: type={client_state.get('type')} — not outbound_sales, skipping")
-        return
-
-    await run_outbound_conversation(ctx, client_state)
+    meta.setdefault("room_name", ctx.room.name)
+    await run_outbound_conversation(ctx, meta)
 
 
 if __name__ == "__main__":

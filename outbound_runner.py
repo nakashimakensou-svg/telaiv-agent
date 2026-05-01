@@ -3,22 +3,27 @@ Telaiv Outbound Runner — AI営業発信ループ
 
 起動: python outbound_runner.py
 常駐プロセスとして動作し、active なキャンペーンを定期ポーリングして
-スケジュール内のリードに対して Telnyx で発信する。
+スケジュール内のリードに対して LiveKit SIP Participant API で発信する。
+
+発信フロー:
+  1. LiveKit Room を作成（メタデータにキャンペーン/リード情報を格納）
+  2. LiveKit SIP Outbound Trunk でリードの電話に発信
+  3. outbound_genai.py エージェントが Room に自動参加して Gemini Live 会話
 
 環境変数:
   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-  TELNYX_API_KEY, TELNYX_APP_ID, TELNYX_PHONE_NUMBER (発信元番号フォールバック)
-  NEXT_PUBLIC_APP_URL
+  LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
+  LIVEKIT_SIP_OUTBOUND_TRUNK_ID  ← LiveKit ダッシュボードで作成した SIP Outbound Trunk ID
   RUNNER_POLL_INTERVAL  ポーリング間隔（秒）、デフォルト 30
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
@@ -34,8 +39,6 @@ logger = logging.getLogger("telaiv-outbound-runner")
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-TELNYX_API_BASE = "https://api.telnyx.com/v2"
-APP_URL = os.environ.get("NEXT_PUBLIC_APP_URL", "https://www.telaiv.com").rstrip("/")
 POLL_INTERVAL = int(os.environ.get("RUNNER_POLL_INTERVAL", "30"))
 COST_PER_MINUTE = 0.03
 LOW_CREDIT_THRESHOLD = 5.0
@@ -157,7 +160,7 @@ async def _check_low_credit_alert(
         pass
 
 
-# ── Telnyx dialing ───────────────────────────────────────────────────────────
+# ── LiveKit SIP dialing ───────────────────────────────────────────────────────
 
 async def _dial_lead(
     session: aiohttp.ClientSession,
@@ -166,78 +169,84 @@ async def _dial_lead(
     tenant_id: str,
 ) -> bool:
     """
-    Telnyx で lead.phone_number に発信する。
-    client_state に campaign_id / lead_id / tenant_id を base64 JSON で埋め込む。
-    成功したら True を返す。
+    LiveKit Room を作成し SIP Outbound Trunk でリードに発信する。
+    Room メタデータにキャンペーン/リード情報を格納する。
+    outbound_genai.py エージェントが Room に自動参加して会話する。
     """
-    api_key = os.environ.get("TELNYX_API_KEY")
-    connection_id = os.environ.get("TELNYX_APP_ID")
-    from_number = campaign.get("caller_number") or os.environ.get("TELNYX_PHONE_NUMBER")
+    trunk_id = os.environ.get("LIVEKIT_SIP_OUTBOUND_TRUNK_ID")
+    lk_url = os.environ.get("LIVEKIT_URL")
+    lk_key = os.environ.get("LIVEKIT_API_KEY")
+    lk_secret = os.environ.get("LIVEKIT_API_SECRET")
 
-    if not api_key or not connection_id or not from_number:
-        logger.error("_dial_lead: missing Telnyx config")
+    if not trunk_id or not lk_url or not lk_key or not lk_secret:
+        logger.error(
+            "_dial_lead: missing LiveKit config "
+            "(LIVEKIT_SIP_OUTBOUND_TRUNK_ID / LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET)"
+        )
         return False
 
-    client_state_data = {
-        "type": "outbound_sales",
-        "campaign_id": campaign["id"],
-        "lead_id": lead["id"],
-        "tenant_id": tenant_id,
-        "script": campaign.get("script", ""),
-    }
-    client_state = base64.b64encode(
-        json.dumps(client_state_data, ensure_ascii=False).encode("utf-8")
-    ).decode("ascii")
-
-    payload = {
-        "connection_id": connection_id,
-        "to": lead["phone_number"],
-        "from": from_number,
-        "webhook_url": f"{APP_URL}/api/telnyx/outbound-webhook",
-        "client_state": client_state,
-        "timeout_secs": 30,
-    }
+    room_name = f"outbound-{campaign['id'][:8]}-{lead['id'][:8]}-{int(time.time())}"
+    room_metadata = json.dumps(
+        {
+            "type": "outbound_sales",
+            "campaign_id": campaign["id"],
+            "lead_id": lead["id"],
+            "tenant_id": tenant_id,
+            "script": campaign.get("script", ""),
+            "room_name": room_name,
+        },
+        ensure_ascii=False,
+    )
 
     try:
-        async with session.post(
-            f"{TELNYX_API_BASE}/calls",
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
+        from livekit import api as lkapi
+
+        async with lkapi.LiveKitAPI(url=lk_url, api_key=lk_key, api_secret=lk_secret) as lk:
+            await lk.room.create_room(
+                lkapi.CreateRoomRequest(
+                    name=room_name,
+                    metadata=room_metadata,
+                    empty_timeout=60,
+                    departure_timeout=30,
+                )
+            )
+            await lk.sip.create_sip_participant(
+                lkapi.CreateSIPParticipantRequest(
+                    sip_trunk_id=trunk_id,
+                    sip_call_to=lead["phone_number"],
+                    room_name=room_name,
+                    participant_identity=f"lead-{lead['id'][:8]}",
+                    participant_name=lead.get("contact_name") or lead["phone_number"],
+                    wait_until_answered=False,
+                )
+            )
+
+        logger.info(
+            f"_dial_lead: room={room_name} lead={lead['id']} to={lead['phone_number']}"
+        )
+        await sb_post(
+            session,
+            "outbound_call_logs",
+            {
+                "campaign_id": campaign["id"],
+                "lead_id": lead["id"],
+                "telnyx_call_id": room_name,
+                "called_at": datetime.now(timezone.utc).isoformat(),
+                "outcome": "dialing",
+                "cost_usd": 0,
             },
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            body = await resp.json()
-            if resp.status in (200, 201, 202):
-                call_control_id = body.get("data", {}).get("call_control_id", "")
-                logger.info(
-                    f"_dial_lead: dialing lead={lead['id']} to={lead['phone_number']} "
-                    f"call_control_id={call_control_id}"
-                )
-                # 発信ログ記録
-                await sb_post(session, "outbound_call_logs", {
-                    "campaign_id": campaign["id"],
-                    "lead_id": lead["id"],
-                    "telnyx_call_id": call_control_id,
-                    "called_at": datetime.now(timezone.utc).isoformat(),
-                    "outcome": "dialing",
-                    "cost_usd": 0,
-                })
-                # リードを calling 状態に
-                await sb_patch(
-                    session, "outbound_leads",
-                    {"id": lead["id"]},
-                    {
-                        "status": "calling",
-                        "last_called_at": datetime.now(timezone.utc).isoformat(),
-                        "retry_count": lead.get("retry_count", 0) + 1,
-                    },
-                )
-                return True
-            else:
-                logger.error(f"_dial_lead: FAILED status={resp.status} body={body}")
-                return False
+        )
+        await sb_patch(
+            session,
+            "outbound_leads",
+            {"id": lead["id"]},
+            {
+                "status": "calling",
+                "last_called_at": datetime.now(timezone.utc).isoformat(),
+                "retry_count": lead.get("retry_count", 0) + 1,
+            },
+        )
+        return True
     except Exception:
         logger.error("_dial_lead: exception", exc_info=True)
         return False
@@ -372,7 +381,7 @@ async def _cleanup_stale_calls(session: aiohttp.ClientSession) -> None:
         {
             "status": "eq.calling",
             "last_called_at": f"lt.{cutoff}",
-            "select": "id,retry_count,campaign_id",
+            "select": "id,campaign_id",
         },
     )
     for lead in rows:

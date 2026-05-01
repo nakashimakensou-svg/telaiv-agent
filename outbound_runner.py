@@ -88,6 +88,10 @@ def _within_schedule(campaign: dict) -> bool:
 
     call_days: list[int] = campaign.get("call_days") or [1, 2, 3, 4, 5]
     if weekday not in call_days:
+        logger.info(
+            f"_within_schedule: SKIP weekday={weekday} not in call_days={call_days} "
+            f"now_jst={now_jst.strftime('%Y-%m-%d %H:%M')} (JST)"
+        )
         return False
 
     start_str: str = campaign.get("call_hours_start") or "09:00"
@@ -98,8 +102,14 @@ def _within_schedule(campaign: dict) -> bool:
         start_minutes = sh * 60 + sm
         end_minutes = eh * 60 + em
         now_minutes = now_jst.hour * 60 + now_jst.minute
-        return start_minutes <= now_minutes < end_minutes
+        in_window = start_minutes <= now_minutes < end_minutes
+        logger.info(
+            f"_within_schedule: now_jst={now_jst.strftime('%H:%M')} "
+            f"window={start_str[:5]}-{end_str[:5]} → {'OK' if in_window else 'SKIP'}"
+        )
+        return in_window
     except Exception:
+        logger.error("_within_schedule: parse error", exc_info=True)
         return False
 
 
@@ -274,34 +284,40 @@ async def _process_campaign(session: aiohttp.ClientSession, campaign: dict) -> N
     budget_limit = float(campaign.get("budget_limit_usd") or 0)
     budget_used = float(campaign.get("budget_used_usd") or 0)
 
+    logger.info(
+        f"campaign={campaign_id}: processing "
+        f"budget={budget_used:.2f}/{budget_limit:.2f} concurrent_calls={concurrent_calls} max_retries={max_retries}"
+    )
+
     # ── 予算チェック ─────────────────────────────────────────────────────
     if budget_limit > 0 and budget_used >= budget_limit:
-        logger.info(f"campaign={campaign_id}: budget exceeded → pausing")
+        logger.info(f"campaign={campaign_id}: SKIP budget exceeded ({budget_used:.2f} >= {budget_limit:.2f}) → pausing")
         await sb_patch(session, "outbound_campaigns", {"id": campaign_id}, {"status": "budget_exceeded"})
         return
 
     # ── スケジュールチェック ──────────────────────────────────────────────
     if not _within_schedule(campaign):
-        logger.debug(f"campaign={campaign_id}: outside schedule, skipping")
+        logger.info(f"campaign={campaign_id}: SKIP outside schedule")
         return
 
     # ── クレジット残高チェック ────────────────────────────────────────────
     balance = await _get_tenant_credits(session, tenant_id)
+    logger.info(f"campaign={campaign_id}: tenant={tenant_id} credit_balance=${balance:.4f}")
     await _check_low_credit_alert(session, tenant_id, balance)
     if balance <= 0:
-        logger.info(f"campaign={campaign_id}: no credits → pausing")
+        logger.info(f"campaign={campaign_id}: SKIP no credits (balance=${balance:.4f}) → pausing")
         await sb_patch(session, "outbound_campaigns", {"id": campaign_id}, {"status": "paused"})
         return
 
     # ── 現在の同時発信数チェック ──────────────────────────────────────────
     active_count = await _active_call_count(session, campaign_id)
     slots = concurrent_calls - active_count
+    logger.info(f"campaign={campaign_id}: active_calls={active_count} slots={slots}/{concurrent_calls}")
     if slots <= 0:
-        logger.debug(f"campaign={campaign_id}: concurrent slots full ({active_count}/{concurrent_calls})")
+        logger.info(f"campaign={campaign_id}: SKIP concurrent slots full ({active_count}/{concurrent_calls})")
         return
 
     # ── 発信対象リードを取得 ─────────────────────────────────────────────
-    # pending か no_answer（retry_count < max_retries）のリードを slots 件取得
     pending_rows = await sb_get(
         session,
         "outbound_leads",
@@ -313,6 +329,8 @@ async def _process_campaign(session: aiohttp.ClientSession, campaign: dict) -> N
             "order": "created_at.asc",
         },
     )
+    logger.info(f"campaign={campaign_id}: pending_leads={len(pending_rows)}")
+
     retry_rows: list[dict] = []
     if len(pending_rows) < slots:
         retry_rows = await sb_get(
@@ -327,11 +345,13 @@ async def _process_campaign(session: aiohttp.ClientSession, campaign: dict) -> N
                 "order": "last_called_at.asc.nullsfirst",
             },
         )
+        logger.info(f"campaign={campaign_id}: retry_leads={len(retry_rows)}")
 
     leads_to_call = (pending_rows + retry_rows)[:slots]
+    logger.info(f"campaign={campaign_id}: leads_to_call={len(leads_to_call)}")
 
     if not leads_to_call:
-        # 発信対象がなければキャンペーン完了
+        # 発信対象がなければキャンペーン完了チェック
         remaining = await sb_get(
             session,
             "outbound_leads",
@@ -341,6 +361,7 @@ async def _process_campaign(session: aiohttp.ClientSession, campaign: dict) -> N
                 "select": "id",
             },
         )
+        logger.info(f"campaign={campaign_id}: no leads to call, remaining_active={len(remaining)}")
         if not remaining:
             logger.info(f"campaign={campaign_id}: all leads processed → completed")
             await sb_patch(session, "outbound_campaigns", {"id": campaign_id}, {"status": "completed"})
@@ -349,6 +370,7 @@ async def _process_campaign(session: aiohttp.ClientSession, campaign: dict) -> N
     # ── 発信 ─────────────────────────────────────────────────────────────
     dialed_count = 0
     for lead in leads_to_call:
+        logger.info(f"campaign={campaign_id}: dialing lead={lead['id']} phone={lead.get('phone_number')}")
         success = await _dial_lead(session, campaign, lead, tenant_id)
         if success:
             dialed_count += 1

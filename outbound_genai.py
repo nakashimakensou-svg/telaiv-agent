@@ -74,6 +74,20 @@ OUTBOUND_SYSTEM_PROMPT = """\
 {script}
 """
 
+TEST_INTRO_SYSTEM_PROMPT = """\
+あなたはTelaivのAIテスト発信担当です。
+
+冒頭で必ず「お世話になります、Telaivのテスト発信です。声は届いていますか？」と日本語で発話してください。
+
+相手が「はい」「届いてる」「聞こえます」など肯定的に反応したら:
+→ 「テストは正常に完了しました。ご協力ありがとうございました。失礼いたします。」と伝え通話を終了してください。
+
+相手が「いいえ」「聞こえない」「雑音がある」など否定的に反応したら:
+→ 「申し訳ありません、再度確認して改めてご連絡いたします。失礼いたします。」と伝え通話を終了してください。
+
+通話時間は20秒以内を目安にしてください。長引かせないでください。
+"""
+
 
 # ── audio utils ───────────────────────────────────────────────────────────────
 
@@ -329,20 +343,52 @@ async def _analyze_conversation(transcript: list[dict], script: str) -> tuple[st
 
 # ── Main conversation ─────────────────────────────────────────────────────────
 
+async def _update_test_call_log(
+    session: aiohttp.ClientSession,
+    call_log_id: str,
+    duration_seconds: int,
+    outcome: str,
+    ai_summary: str,
+) -> None:
+    """テスト発信の通話終了後に outbound_call_logs を更新する。"""
+    if not SUPABASE_URL or not SUPABASE_KEY or not call_log_id:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/outbound_call_logs"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with session.patch(
+        url,
+        headers=headers,
+        params={"id": f"eq.{call_log_id}"},
+        json={"duration_seconds": duration_seconds, "outcome": outcome, "ai_summary": ai_summary},
+    ) as resp:
+        if not resp.ok:
+            logger.error(f"_update_test_call_log: {resp.status} {await resp.text()}")
+
+
 async def run_outbound_conversation(ctx: JobContext, client_state: dict) -> None:
+    scenario = client_state.get("scenario", "sales_intro")
     campaign_id = client_state.get("campaign_id", "")
     lead_id = client_state.get("lead_id", "")
     tenant_id = client_state.get("tenant_id", "")
     script = client_state.get("script", "")
-    call_control_id = client_state.get("call_control_id") or client_state.get("room_name", "")
+    call_log_id = client_state.get("call_log_id", "")
+    call_control_id = call_log_id or client_state.get("call_control_id") or client_state.get("room_name", "")
 
     logger.info(
-        f"run_outbound_conversation: "
-        f"campaign={campaign_id} lead={lead_id} tenant={tenant_id}"
+        f"run_outbound_conversation: scenario={scenario} "
+        f"campaign={campaign_id} lead={lead_id} tenant={tenant_id} call_log_id={call_log_id}"
     )
 
     gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    system_prompt = OUTBOUND_SYSTEM_PROMPT.format(script=script or "自社サービスの紹介")
+
+    if scenario == "test_intro":
+        system_prompt = TEST_INTRO_SYSTEM_PROMPT
+    else:
+        system_prompt = OUTBOUND_SYSTEM_PROMPT.format(script=script or "自社サービスの紹介")
 
     gemini_config = genai_types.LiveConnectConfig(
         response_modalities=["AUDIO"],
@@ -448,32 +494,34 @@ async def run_outbound_conversation(ctx: JobContext, client_state: dict) -> None
     duration_seconds = int((ended_at - started_at).total_seconds())
 
     outcome, summary = await _analyze_conversation(transcript, script)
-    logger.info(f"run_outbound_conversation: outcome={outcome} summary={summary!r}")
+    logger.info(f"run_outbound_conversation: outcome={outcome} summary={summary!r} scenario={scenario}")
 
     async with aiohttp.ClientSession() as http:
-        cost_usd = await _deduct_credits(http, tenant_id, duration_seconds)
+        if scenario == "test_intro":
+            # テスト発信: call_log を id で直接更新、クレジット消費なし
+            await _update_test_call_log(http, call_log_id, duration_seconds, outcome, summary)
+        else:
+            # 通常発信: クレジット消費・リード/キャンペーン更新
+            cost_usd = await _deduct_credits(http, tenant_id, duration_seconds)
 
-        await _update_lead_outcome(http, lead_id, outcome, summary)
+            await _update_lead_outcome(http, lead_id, outcome, summary)
 
-        if call_control_id:
-            await _update_call_log(
-                http, campaign_id, lead_id, call_control_id,
-                duration_seconds, outcome, summary, cost_usd,
-            )
+            if call_control_id:
+                await _update_call_log(
+                    http, campaign_id, lead_id, call_control_id,
+                    duration_seconds, outcome, summary, cost_usd,
+                )
 
-        is_interested = outcome == "interested"
-        await _update_campaign_stats(http, campaign_id, connected, is_interested, cost_usd)
+            is_interested = outcome == "interested"
+            await _update_campaign_stats(http, campaign_id, connected, is_interested, cost_usd)
 
-        if is_interested:
-            campaign = await _sb_get_one(http, "outbound_campaigns", {"id": campaign_id})
-            lead = await _sb_get_one(http, "outbound_leads", {"id": lead_id})
-            if campaign and lead:
-                await _notify_slack_hot_lead(http, lead, campaign.get("name", ""), summary)
+            if is_interested:
+                campaign = await _sb_get_one(http, "outbound_campaigns", {"id": campaign_id})
+                lead = await _sb_get_one(http, "outbound_leads", {"id": lead_id})
+                if campaign and lead:
+                    await _notify_slack_hot_lead(http, lead, campaign.get("name", ""), summary)
 
-    logger.info(
-        f"run_outbound_conversation: done "
-        f"duration={duration_seconds}s cost=${cost_usd:.4f} outcome={outcome}"
-    )
+            logger.info(f"run_outbound_conversation: done duration={duration_seconds}s cost=${cost_usd:.4f} outcome={outcome}")
 
 
 # ── LiveKit entrypoint ────────────────────────────────────────────────────────

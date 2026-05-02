@@ -144,6 +144,34 @@ async def outbound_dial(req: DialRequest):
                 )
             )
             logger.info(f"[DEBUG] LIVEKIT_SIP_OUTBOUND_TRUNK_ID env value: {trunk_id!r}")
+
+            # Agent を Room に明示 dispatch (SIP 発信より必ず先に実行)
+            dispatch_metadata = json.dumps(
+                {
+                    "type": "outbound_sales",
+                    "call_log_id": req.call_log_id,
+                    "scenario": req.scenario,
+                    "caller_name": req.caller_name,
+                    "company_name": req.company_name,
+                    "tenant_id": req.tenant_id or "",
+                    "room_name": room_name,
+                },
+                ensure_ascii=False,
+            )
+            logger.info(
+                f"[DEBUG] About to call create_dispatch: agent_name=telaiv-agent room={room_name}"
+            )
+            dispatch = await lk.agent_dispatch.create_dispatch(
+                lkapi.CreateAgentDispatchRequest(
+                    agent_name="telaiv-agent",
+                    room=room_name,
+                    metadata=dispatch_metadata,
+                )
+            )
+            logger.info(
+                f"[DEBUG] agent dispatched: dispatch_id={dispatch.id} room={room_name}"
+            )
+
             logger.info(
                 f"[DEBUG] About to call create_sip_participant: "
                 f"trunk_id={trunk_id!r} room={room_name!r} to={req.to_number!r}"

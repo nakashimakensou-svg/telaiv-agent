@@ -922,11 +922,12 @@ async def run_conversation(
                 start_of_speech_sensitivity=genai_types.StartSensitivity.START_SENSITIVITY_HIGH,
                 end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_HIGH,
                 prefix_padding_ms=100,   # 200→100ms: 発話検知後より素早くAIを停止
-                silence_duration_ms=300, # 400→300ms: 発話終了をより早く確定
+                silence_duration_ms=400, # 300→400ms: 短すぎると発話途中で切られる問題を緩和
             ),
         ),
         **_transcription_kwargs,
     )
+    logger.info("[DEBUG] turn_detection: silence=400ms padding=100ms sensitivity=HIGH/HIGH interrupts=START_OF_ACTIVITY")
 
     room_disconnected = asyncio.Event()
     ctx.room.on("disconnected", lambda *_: room_disconnected.set())

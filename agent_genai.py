@@ -855,14 +855,7 @@ async def run_conversation(
     # SDKバージョンによっては未対応のため安全に設定
     _transcription_kwargs: dict = {}
     if hasattr(genai_types, "AudioTranscriptionConfig"):
-        try:
-            _transcription_kwargs["input_audio_transcription"] = genai_types.AudioTranscriptionConfig(
-                language_code="ja-JP"
-            )
-            logger.info("[DEBUG] AudioTranscriptionConfig: language_code=ja-JP set")
-        except TypeError:
-            _transcription_kwargs["input_audio_transcription"] = genai_types.AudioTranscriptionConfig()
-            logger.info("[DEBUG] AudioTranscriptionConfig: language_code not supported by SDK, using defaults")
+        _transcription_kwargs["input_audio_transcription"] = genai_types.AudioTranscriptionConfig()
 
     live_config = genai_types.LiveConnectConfig(
         response_modalities=["AUDIO"],

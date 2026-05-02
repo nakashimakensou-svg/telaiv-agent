@@ -344,6 +344,20 @@ def _get_supabase():
     )
 
 
+_OUTCOME_DB_MAP: dict[str, str] = {
+    "resolved":      "completed",
+    "escalated":     "completed",
+    "abandoned":     "no_answer",
+    "completed":     "completed",
+    "error":         "error",
+    "no_answer":     "no_answer",
+    "busy":          "busy",
+    "voicemail":     "voicemail",
+    "interested":    "interested",
+    "not_interested":"not_interested",
+}
+
+
 async def update_call_log_on_end(
     call_log_id: str,
     duration_seconds: int,
@@ -354,17 +368,18 @@ async def update_call_log_on_end(
     """outbound_call_logs を通話終了時に UPDATE する。失敗してもログのみ出力して続行。"""
     if not call_log_id:
         return
+    db_outcome = _OUTCOME_DB_MAP.get(outcome, "completed")
     try:
         sb = _get_supabase()
         sb.from_("outbound_call_logs").update({
-            "outcome": outcome,
+            "outcome": db_outcome,
             "duration_seconds": duration_seconds,
             "transcript": transcript_text or None,
             "ai_summary": ai_summary,
         }).eq("id", call_log_id).execute()
         logger.info(
             f"update_call_log_on_end: ok call_log_id={call_log_id} "
-            f"outcome={outcome} duration={duration_seconds}s"
+            f"outcome={outcome}->{db_outcome} duration={duration_seconds}s"
         )
     except Exception:
         logger.error(f"update_call_log_on_end: failed call_log_id={call_log_id}", exc_info=True)
@@ -1005,7 +1020,7 @@ async def run_conversation(
                         ai_chunks.append(response.data)     # 録音バッファに蓄積
                         audio_in_queue.put_nowait(response.data)
 
-                    # response.text: テキスト転写
+                    # response.text: テキスト転写 (audio-only モードでは空の場合あり)
                     if response.text:
                         logger.info(f"receive_audio: agent text: {response.text!r}")
                         transcript.append({
@@ -1016,6 +1031,23 @@ async def run_conversation(
                         for kw in escalation_kw:
                             if kw in response.text:
                                 escalated = True
+
+                    # model_turn.parts: audio-only モードで AI テキストが response.text に来ない場合の補完
+                    if sc:
+                        model_turn = getattr(sc, "model_turn", None)
+                        if model_turn:
+                            for part in getattr(model_turn, "parts", []) or []:
+                                part_text = getattr(part, "text", None)
+                                if part_text and part_text != response.text:
+                                    logger.info(f"receive_audio: AI model_turn text: {part_text!r}")
+                                    transcript.append({
+                                        "role": "agent",
+                                        "text": part_text,
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    })
+                                    for kw in escalation_kw:
+                                        if kw in part_text:
+                                            escalated = True
 
                 # ターン完了 — play_audio に即時フラッシュを指示してからキューを空にする
                 logger.info(

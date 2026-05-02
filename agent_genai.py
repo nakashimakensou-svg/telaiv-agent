@@ -48,6 +48,15 @@ EMERGENCY_KEYWORDS = ["雨漏り", "水漏れ", "緊急", "事故"]
 DEFAULT_GREETING = "はい、お電話ありがとうございます。"
 DEFAULT_ESCALATION_KEYWORDS = ["クレーム", "担当者", "責任者", "上の者", "社長"]
 
+OUTBOUND_TEST_INTRO_PROMPT = """\
+あなたはTelaivのテスト発信AIです。
+電話に出た相手に対して、すぐに次のセリフで挨拶してください:
+「お世話になります。テライブからのテスト発信です。音声確認のためお電話しました。30秒ほどよろしいでしょうか。」
+相手の応答に対して自然な会話を5往復程度継続してください。
+会話が終わったら「ありがとうございました。テスト発信を終了します。失礼いたします。」と言って会話を終えてください。
+営業時間案内や他の案内は一切不要です。
+"""
+
 # ─── 汎用対応ルール（全テナント共通・上書き不可）─────────────────────────────
 # {business_hours_note} は run_conversation で動的に差し込む
 DEFAULT_SYSTEM_PROMPT = """\
@@ -784,6 +793,7 @@ async def run_conversation(
     telnyx_call_id: Optional[str],   # call_logs 更新用
     caller_number: Optional[str],    # 発信者番号（リピーター認識用）
     transcript: list[dict],          # OUT: entrypoint が作成した共有リスト（in-place 蓄積）
+    override_system_prompt: Optional[str] = None,  # 指定時は full_instructions を完全差し替え
 ) -> str:                            # outcome のみ返す
 
     company = (config or {}).get("company_name") or "中島建装"
@@ -817,6 +827,10 @@ async def run_conversation(
             f"{caller_context}\n\n"
             f"【重要】過去の通話回数が1回以上の場合、最初の挨拶で「以前もお電話いただきありがとうございます」と自然に触れてください。"
         )
+
+    # Outbound など専用プロンプトを丸ごと差し替える場合
+    if override_system_prompt:
+        full_instructions = override_system_prompt
 
     escalated = False
 
@@ -1110,6 +1124,62 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
 
     start_time = datetime.now(timezone.utc)
+
+    # AgentDispatch 経由のメタデータを優先、なければ room metadata
+    try:
+        meta = json.loads((ctx.job.metadata if ctx.job.metadata else None) or ctx.room.metadata or "{}")
+    except (json.JSONDecodeError, AttributeError):
+        meta = {}
+
+    call_type = meta.get("type", "")
+    scenario = meta.get("scenario", "")
+    logger.info(f"[DEBUG] entrypoint metadata: type={call_type!r} scenario={scenario!r}")
+
+    # Outbound 発信の場合は専用プロンプトで run_conversation を実行して終了
+    if call_type == "outbound_sales":
+        if scenario == "test_intro":
+            override_prompt = OUTBOUND_TEST_INTRO_PROMPT
+        else:
+            override_prompt = OUTBOUND_TEST_INTRO_PROMPT  # 将来は別プロンプトに差し替え
+        logger.info(f"[DEBUG] outbound_sales detected — using override_system_prompt scenario={scenario!r}")
+
+        audio_source = rtc.AudioSource(RECV_SAMPLE_RATE, CHANNELS)
+        local_track = rtc.LocalAudioTrack.create_audio_track("agent-audio", audio_source)
+        await ctx.room.local_participant.publish_track(local_track)
+
+        audio_track: Optional[rtc.RemoteAudioTrack] = None
+        for _ in range(30):
+            for p in ctx.room.remote_participants.values():
+                for pub in p.track_publications.values():
+                    if pub.track and isinstance(pub.track, rtc.RemoteAudioTrack):
+                        audio_track = pub.track
+                        break
+                if audio_track:
+                    break
+            if audio_track:
+                break
+            await asyncio.sleep(0.5)
+
+        if not audio_track:
+            logger.error("outbound: No remote audio track found, exiting")
+            return
+
+        logger.info("outbound: Audio track acquired, starting outbound conversation")
+        caller_chunks: list[bytes] = []
+        ai_chunks: list[bytes] = []
+        transcript: list[dict] = []
+
+        await run_conversation(
+            ctx, None, audio_source, audio_track,
+            caller_chunks=caller_chunks,
+            ai_chunks=ai_chunks,
+            telnyx_call_id=None,
+            caller_number=None,
+            transcript=transcript,
+            override_system_prompt=override_prompt,
+        )
+        logger.info("outbound: conversation ended")
+        return
 
     called_number: Optional[str] = None
     caller_number: Optional[str] = None

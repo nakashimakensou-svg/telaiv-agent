@@ -344,6 +344,32 @@ def _get_supabase():
     )
 
 
+async def update_call_log_on_end(
+    call_log_id: str,
+    duration_seconds: int,
+    transcript_text: str,
+    ai_summary: Optional[str],
+    outcome: str,
+) -> None:
+    """outbound_call_logs を通話終了時に UPDATE する。失敗してもログのみ出力して続行。"""
+    if not call_log_id:
+        return
+    try:
+        sb = _get_supabase()
+        sb.from_("outbound_call_logs").update({
+            "outcome": outcome,
+            "duration_seconds": duration_seconds,
+            "transcript": transcript_text or None,
+            "ai_summary": ai_summary,
+        }).eq("id", call_log_id).execute()
+        logger.info(
+            f"update_call_log_on_end: ok call_log_id={call_log_id} "
+            f"outcome={outcome} duration={duration_seconds}s"
+        )
+    except Exception:
+        logger.error(f"update_call_log_on_end: failed call_log_id={call_log_id}", exc_info=True)
+
+
 async def get_concierge_config(called_number: str) -> Optional[dict]:
     try:
         sb = _get_supabase()
@@ -1143,6 +1169,8 @@ async def entrypoint(ctx: JobContext) -> None:
             override_prompt = OUTBOUND_TEST_INTRO_PROMPT  # 将来は別プロンプトに差し替え
         logger.info(f"[DEBUG] outbound_sales detected — using override_system_prompt scenario={scenario!r}")
 
+        call_log_id: str = meta.get("call_log_id", "")
+
         audio_source = rtc.AudioSource(RECV_SAMPLE_RATE, CHANNELS)
         local_track = rtc.LocalAudioTrack.create_audio_track("agent-audio", audio_source)
         await ctx.room.local_participant.publish_track(local_track)
@@ -1162,6 +1190,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
         if not audio_track:
             logger.error("outbound: No remote audio track found, exiting")
+            duration = int((datetime.now(timezone.utc) - start_time).total_seconds())
+            await update_call_log_on_end(call_log_id, duration, "", None, "no_answer")
             return
 
         logger.info("outbound: Audio track acquired, starting outbound conversation")
@@ -1169,16 +1199,31 @@ async def entrypoint(ctx: JobContext) -> None:
         ai_chunks: list[bytes] = []
         transcript: list[dict] = []
 
-        await run_conversation(
-            ctx, None, audio_source, audio_track,
-            caller_chunks=caller_chunks,
-            ai_chunks=ai_chunks,
-            telnyx_call_id=None,
-            caller_number=None,
-            transcript=transcript,
-            override_system_prompt=override_prompt,
+        conv_outcome = "completed"
+        try:
+            conv_outcome = await run_conversation(
+                ctx, None, audio_source, audio_track,
+                caller_chunks=caller_chunks,
+                ai_chunks=ai_chunks,
+                telnyx_call_id=None,
+                caller_number=None,
+                transcript=transcript,
+                override_system_prompt=override_prompt,
+            ) or "completed"
+        except Exception:
+            logger.error("outbound: run_conversation raised", exc_info=True)
+            conv_outcome = "error"
+
+        duration = int((datetime.now(timezone.utc) - start_time).total_seconds())
+        transcript_text = "\n".join(
+            f"[{'AI' if t.get('role') == 'agent' else 'USER'}] {t.get('text', '')}"
+            for t in transcript if t.get("text")
         )
-        logger.info("outbound: conversation ended")
+        logger.info(
+            f"outbound: conversation ended outcome={conv_outcome} "
+            f"duration={duration}s transcript_lines={len(transcript)}"
+        )
+        await update_call_log_on_end(call_log_id, duration, transcript_text, None, conv_outcome)
         return
 
     called_number: Optional[str] = None

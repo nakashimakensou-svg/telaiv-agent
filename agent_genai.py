@@ -941,12 +941,19 @@ async def run_conversation(
         """LiveKit音声フレームを out_queue に積む (16kHz PCM)"""
         logger.info("listen_audio: started")
         frames = 0
+        _logged_format = False
         try:
             async for frame_event in audio_stream:
                 data = bytes(frame_event.frame.data)
                 frames += 1
-                if frames == 1:
-                    logger.info("listen_audio: first frame received from LiveKit")
+                if not _logged_format:
+                    fr = frame_event.frame
+                    logger.info(
+                        f"[DEBUG] LiveKit audio format: {fr.sample_rate}Hz"
+                        f" channels={fr.num_channels}"
+                        f" samples_per_channel={fr.samples_per_channel}"
+                    )
+                    _logged_format = True
                 caller_chunks.append(data)  # 録音バッファに蓄積
                 try:
                     out_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})

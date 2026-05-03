@@ -55,7 +55,12 @@ class DialRequest(BaseModel):
     company_name: str
     call_log_id: str
     tenant_id: Optional[str] = None
-    scenario: str = "test_intro"
+    scenario: str = "test_intro"           # 後方互換
+    stage: Optional[str] = None            # 新: seeding/watering/fertilizing/harvesting/inbound/test_intro
+    customer_context: Optional[dict] = None  # 顧客マスター情報（Phase β で自動取得）
+    tenant_context: Optional[dict] = None    # テナント企業情報
+    allow_final_close: bool = False          # AI に最終契約権限を与えるか
+    custom_overrides: Optional[dict] = None  # 追加指示
 
 
 def _sb_headers() -> dict[str, str]:
@@ -113,21 +118,31 @@ async def outbound_dial(req: DialRequest):
         raise HTTPException(status_code=500, detail=msg)
 
     room_name = f"outbound-{req.call_log_id}"
-    room_metadata = json.dumps(
-        {
-            "type": "outbound_sales",
-            "call_log_id": req.call_log_id,
-            "scenario": req.scenario,
-            "caller_name": req.caller_name,
-            "company_name": req.company_name,
-            "tenant_id": req.tenant_id or "",
-            "room_name": room_name,
-        },
-        ensure_ascii=False,
-    )
+    _stage = req.stage or req.scenario or "test_intro"
+    _base_meta = {
+        "type": "outbound_sales",
+        "call_log_id": req.call_log_id,
+        "scenario": req.scenario,   # 後方互換
+        "stage": _stage,
+        "caller_name": req.caller_name,
+        "company_name": req.company_name,
+        "tenant_id": req.tenant_id or "",
+        "room_name": room_name,
+        "allow_final_close": req.allow_final_close,
+    }
+    if req.customer_context:
+        _base_meta["customer_context"] = req.customer_context
+    if req.tenant_context:
+        _base_meta["tenant_context"] = req.tenant_context
+    elif req.company_name:
+        _base_meta["tenant_context"] = {"company_name": req.company_name}
+    if req.custom_overrides:
+        _base_meta["custom_overrides"] = req.custom_overrides
+
+    room_metadata = json.dumps(_base_meta, ensure_ascii=False)
 
     logger.info(
-        f"/outbound/dial: to={req.to_number} scenario={req.scenario} "
+        f"/outbound/dial: to={req.to_number} stage={_stage!r} "
         f"room={room_name} call_log_id={req.call_log_id}"
     )
 
@@ -146,18 +161,7 @@ async def outbound_dial(req: DialRequest):
             logger.info(f"[DEBUG] LIVEKIT_SIP_OUTBOUND_TRUNK_ID env value: {trunk_id!r}")
 
             # Agent を Room に明示 dispatch (SIP 発信より必ず先に実行)
-            dispatch_metadata = json.dumps(
-                {
-                    "type": "outbound_sales",
-                    "call_log_id": req.call_log_id,
-                    "scenario": req.scenario,
-                    "caller_name": req.caller_name,
-                    "company_name": req.company_name,
-                    "tenant_id": req.tenant_id or "",
-                    "room_name": room_name,
-                },
-                ensure_ascii=False,
-            )
+            dispatch_metadata = room_metadata  # room と同一の metadata を使い回す
             logger.info(
                 f"[DEBUG] About to call create_dispatch: agent_name=telaiv-agent room={room_name}"
             )

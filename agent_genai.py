@@ -1195,11 +1195,21 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # Outbound 発信の場合は専用プロンプトで run_conversation を実行して終了
     if call_type == "outbound_sales":
-        _scenario = scenario if scenario in ("test_intro", "sales", "inbound") else "test_intro"
+        # stage 優先、なければ scenario を fallback（後方互換）
+        _stage = meta.get("stage") or scenario or "test_intro"
         _customer_context = meta.get("customer_context", None)
-        override_prompt = build_telai_prompt(scenario=_scenario, customer_context=_customer_context)
-        logger.info(f"[DEBUG] outbound_sales detected — using telai_prompts v1.0 scenario={_scenario!r}")
-        logger.info(f"[DEBUG] telai_prompts: scenario={_scenario}, length={len(override_prompt)} chars")
+        _tenant_context = meta.get("tenant_context", None)
+        _allow_final_close = meta.get("allow_final_close", False)
+        _custom_overrides = meta.get("custom_overrides", None)
+        override_prompt = build_telai_prompt(
+            stage=_stage,
+            customer_context=_customer_context,
+            tenant_context=_tenant_context,
+            allow_final_close=_allow_final_close,
+            custom_overrides=_custom_overrides,
+        )
+        logger.info(f"[DEBUG] outbound_sales detected — using telai_prompts v1.0 stage={_stage!r}")
+        logger.info(f"[DEBUG] telai_prompts: stage={_stage}, length={len(override_prompt)} chars")
 
         call_log_id: str = meta.get("call_log_id", "")
 

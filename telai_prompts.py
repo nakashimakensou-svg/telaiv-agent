@@ -278,6 +278,7 @@ def build_telai_prompt(
     tenant_context: dict = None,
     allow_final_close: bool = False,
     custom_overrides: dict = None,
+    db_stage_prompts: dict = None,
 ) -> str:
     """
     テライの最終プロンプトを構築する。
@@ -288,6 +289,8 @@ def build_telai_prompt(
         tenant_context: 顧客企業情報 (会社名・業種など)
         allow_final_close: AI に最終契約権限を与えるか (harvesting 段階で使用)
         custom_overrides: 顧客企業のカスタム追加指示
+        db_stage_prompts: DB から取得した段階別プロンプト設定 (concierge_stage_prompts)
+            shape: {"seeding": {"prompt_addition": "...", "opening_line": "...", ...}, ...}
 
     Returns:
         Gemini Live に渡す system_prompt 文字列
@@ -295,7 +298,55 @@ def build_telai_prompt(
     if stage not in _VALID_STAGES:
         stage = "test_intro"
 
+    # DB の段階別カスタマイズ（テナントが設定していれば）
+    db_sp = (db_stage_prompts or {}).get(stage, {})
+
     parts = [TELAI_BASE_PROMPT, STAGE_PROMPTS[stage]]
+
+    # DB カスタマイズ: 追加指示
+    if db_sp.get("prompt_addition"):
+        parts.append(f"""
+【段階別カスタマイズ（テナント設定）】
+{db_sp["prompt_addition"]}
+""")
+
+    if db_sp.get("opening_line"):
+        parts.append(f"""
+【オープニング（テナント指定）】
+この段階ではオープニングを必ず次の一文で始めてください:
+「{db_sp["opening_line"]}」
+""")
+
+    if db_sp.get("closing_line"):
+        parts.append(f"""
+【クロージング（テナント指定）】
+会話を締める際は必ず次の一文を使ってください:
+「{db_sp["closing_line"]}」
+""")
+
+    goals = db_sp.get("goals") or []
+    if goals:
+        goals_text = "\n".join(f"- {g}" for g in goals)
+        parts.append(f"""
+【追加ゴール（テナント設定）】
+{goals_text}
+""")
+
+    forbidden = db_sp.get("forbidden_phrases") or []
+    if forbidden:
+        forbidden_text = "\n".join(f"- 「{p}」" for p in forbidden)
+        parts.append(f"""
+【追加禁止フレーズ（テナント設定）】
+以下のフレーズは使わないでください:
+{forbidden_text}
+""")
+
+    max_dur = db_sp.get("max_duration_seconds")
+    if max_dur:
+        parts.append(f"""
+【通話時間上限（テナント設定）】
+この通話は最大 {max_dur} 秒（約 {max_dur // 60} 分）以内に自然に締めてください。
+""")
 
     if tenant_context:
         company = tenant_context.get("company_name", "")

@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY agent.py agent_genai.py telai_prompts.py report.py sms.py outbound_call.py outbound_runner.py outbound_genai.py dial_server.py start.sh ./
+COPY agent.py agent_genai.py telai_prompts.py report.py sms.py outbound_call.py outbound_runner.py outbound_genai.py dial_server.py business_hours.py start.sh ./
 RUN chmod +x start.sh
 
 # silero VAD モデルを事前ダウンロード（コールドスタート対策）

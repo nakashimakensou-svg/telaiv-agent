@@ -23,6 +23,12 @@ from livekit.agents import JobContext, WorkerOptions, cli
 from google import genai
 from google.genai import types as genai_types
 from telai_prompts import build_telai_prompt
+from business_hours import (
+    is_within_business_hours,
+    get_after_hours_action,
+    get_transfer_number,
+    get_fallback_action,
+)
 
 load_dotenv()
 
@@ -406,6 +412,32 @@ async def get_concierge_config(called_number: str) -> Optional[dict]:
         return {**cc.data[0], "plan": plan}
     except Exception as e:
         logger.error(f"get_concierge_config error: {e}")
+        return None
+
+
+async def get_ivr_config(called_number: str) -> Optional[dict]:
+    """Fetch the ivr_configs row for the given phone number (E.164).
+    Returns the full row dict including `schedule` JSONB, or None.
+    """
+    try:
+        sb = _get_supabase()
+        pn = sb.from_("phone_numbers") \
+            .select("id") \
+            .eq("number", called_number) \
+            .eq("is_active", True) \
+            .limit(1).execute()
+        if not pn.data:
+            return None
+        phone_number_id = pn.data[0]["id"]
+
+        ivr = sb.from_("ivr_configs") \
+            .select("*") \
+            .eq("phone_number_id", phone_number_id) \
+            .order("updated_at", desc=True) \
+            .limit(1).execute()
+        return ivr.data[0] if ivr.data else None
+    except Exception as e:
+        logger.error(f"get_ivr_config error: {e}")
         return None
 
 
@@ -827,6 +859,7 @@ async def run_conversation(
     caller_number: Optional[str],    # 発信者番号（リピーター認識用）
     transcript: list[dict],          # OUT: entrypoint が作成した共有リスト（in-place 蓄積）
     override_system_prompt: Optional[str] = None,  # 指定時は full_instructions を完全差し替え
+    ivr_schedule: Optional[dict] = None,           # ivr_configs.schedule JSONB（DB優先営業時間判定）
 ) -> str:                            # outcome のみ返す
 
     company = (config or {}).get("company_name") or "中島建装"
@@ -837,10 +870,21 @@ async def run_conversation(
     escalation_kw = (config or {}).get("escalation_keywords") or DEFAULT_ESCALATION_KEYWORDS
     voice = (config or {}).get("voice") or "Zephyr"
 
-    # 営業時間を呼び出しのタイミングで動的判定
+    # 営業時間を呼び出しのタイミングで動的判定（DB schedule 優先、env var フォールバック）
+    _in_business_hours = is_within_business_hours(ivr_schedule)
     business_hours_note = _build_business_hours_note()
     base_rules = DEFAULT_SYSTEM_PROMPT.format(business_hours_note=business_hours_note)
-    logger.info(f"business_hours: {'in' if is_business_hours() else 'out'}")
+    logger.info(
+        f"business_hours: {'in' if _in_business_hours else 'out'} "
+        f"(source={'db_schedule' if ivr_schedule else 'env_var'})"
+    )
+    if not _in_business_hours:
+        _after_hours_action = get_after_hours_action(ivr_schedule)
+        _transfer_number = get_transfer_number(ivr_schedule)
+        logger.info(
+            f"after_hours_action: {_after_hours_action} "
+            f"transfer_number: {_transfer_number or 'none'}"
+        )
 
     full_instructions = (
         f"{base_rules}\n\n"
@@ -1209,12 +1253,14 @@ async def entrypoint(ctx: JobContext) -> None:
         _tenant_context = meta.get("tenant_context", None)
         _allow_final_close = meta.get("allow_final_close", False)
         _custom_overrides = meta.get("custom_overrides", None)
+        _db_stage_prompts = meta.get("db_stage_prompts", None)
         override_prompt = build_telai_prompt(
             stage=_stage,
             customer_context=_customer_context,
             tenant_context=_tenant_context,
             allow_final_close=_allow_final_close,
             custom_overrides=_custom_overrides,
+            db_stage_prompts=_db_stage_prompts,
         )
         logger.info(f"[DEBUG] outbound_sales detected — using telai_prompts v1.0 stage={_stage!r}")
         logger.info(f"[DEBUG] telai_prompts: stage={_stage}, length={len(override_prompt)} chars")
@@ -1306,6 +1352,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
     logger.info(f"called_number={called_number} caller_number={caller_number}")
     config = await get_concierge_config(called_number) if called_number else None
+    ivr_config = await get_ivr_config(called_number) if called_number else None
+    ivr_schedule = (ivr_config or {}).get("schedule") if ivr_config else None
+    if ivr_config:
+        _fallback = get_fallback_action(ivr_config)
+        logger.info(f"fallback_action (from DB): {_fallback}")
 
     # AudioSource は Gemini の出力サンプルレート (24kHz) で作成
     audio_source = rtc.AudioSource(RECV_SAMPLE_RATE, CHANNELS)
@@ -1403,6 +1454,7 @@ async def entrypoint(ctx: JobContext) -> None:
         telnyx_call_id=telnyx_call_id,
         caller_number=caller_number,
         transcript=transcript,
+        ivr_schedule=ivr_schedule,
     )
 
     duration = int((datetime.now(timezone.utc) - start_time).total_seconds())

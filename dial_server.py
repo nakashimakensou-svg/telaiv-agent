@@ -71,6 +71,59 @@ def _sb_headers() -> dict[str, str]:
     }
 
 
+async def fetch_stage_prompts_from_db(tenant_id: str) -> dict:
+    """Fetch concierge_stage_prompts for a tenant from Supabase.
+
+    Returns a dict mapping stage name -> prompt fields, e.g.:
+      {"seeding": {"prompt_addition": "...", "opening_line": "...", ...}}
+    Returns {} on error or if no prompts configured.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY or not tenant_id:
+        return {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Step 1: get concierge_config id for tenant
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/concierge_configs",
+                headers=_sb_headers(),
+                params={
+                    "tenant_id": f"eq.{tenant_id}",
+                    "select": "id",
+                    "order": "created_at.asc",
+                    "limit": "1",
+                },
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if not resp.ok:
+                    logger.warning(f"fetch_stage_prompts_from_db: concierge_configs query failed status={resp.status}")
+                    return {}
+                configs = await resp.json()
+                if not configs:
+                    return {}
+                config_id = configs[0]["id"]
+
+            # Step 2: get stage_prompts for that config
+            async with session.get(
+                f"{SUPABASE_URL}/rest/v1/concierge_stage_prompts",
+                headers=_sb_headers(),
+                params={
+                    "concierge_config_id": f"eq.{config_id}",
+                    "select": "stage,prompt_addition,opening_line,closing_line,max_duration_seconds,goals,forbidden_phrases",
+                },
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if not resp.ok:
+                    logger.warning(f"fetch_stage_prompts_from_db: stage_prompts query failed status={resp.status}")
+                    return {}
+                rows = await resp.json()
+                result = {r["stage"]: r for r in rows if r.get("stage")}
+                logger.info(f"fetch_stage_prompts_from_db: tenant={tenant_id} stages={list(result.keys())}")
+                return result
+    except Exception:
+        logger.warning("fetch_stage_prompts_from_db: exception", exc_info=True)
+        return {}
+
+
 async def _mark_error(call_log_id: str, message: str) -> None:
     """outbound_call_logs を error 状態に更新する。"""
     if not SUPABASE_URL or not SUPABASE_KEY or not call_log_id:
@@ -138,6 +191,12 @@ async def outbound_dial(req: DialRequest):
         _base_meta["tenant_context"] = {"company_name": req.company_name}
     if req.custom_overrides:
         _base_meta["custom_overrides"] = req.custom_overrides
+
+    # Fetch DB stage prompts so agent can use tenant-customized prompts
+    if req.tenant_id:
+        db_stage_prompts = await fetch_stage_prompts_from_db(req.tenant_id)
+        if db_stage_prompts:
+            _base_meta["db_stage_prompts"] = db_stage_prompts
 
     room_metadata = json.dumps(_base_meta, ensure_ascii=False)
 

@@ -890,6 +890,11 @@ async def run_conversation(
     if hasattr(genai_types, "AudioTranscriptionConfig"):
         _transcription_kwargs["input_audio_transcription"] = genai_types.AudioTranscriptionConfig()
 
+    # thinking_config: thinking_budget=0 でモデル内部思考を無効化 → 最低レイテンシ
+    _thinking_kwargs: dict = {}
+    if hasattr(genai_types, "ThinkingConfig"):
+        _thinking_kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
+
     live_config = genai_types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction=genai_types.Content(
@@ -910,6 +915,8 @@ async def run_conversation(
         realtime_input_config=genai_types.RealtimeInputConfig(
             # 話し始めたら即座にAI発話を中断する
             activity_handling=genai_types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+            # 発話区間のみをターンとしてカウント（無音を含まない）→ レイテンシ削減
+            turn_coverage=genai_types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
             automatic_activity_detection=genai_types.AutomaticActivityDetection(
                 start_of_speech_sensitivity=genai_types.StartSensitivity.START_SENSITIVITY_HIGH,
                 end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_HIGH,
@@ -918,8 +925,9 @@ async def run_conversation(
             ),
         ),
         **_transcription_kwargs,
+        **_thinking_kwargs,
     )
-    logger.info("[DEBUG] turn_detection: silence=400ms padding=100ms sensitivity=HIGH/HIGH interrupts=START_OF_ACTIVITY")
+    logger.info("[DEBUG] turn_detection: silence=400ms padding=100ms sensitivity=HIGH/HIGH interrupts=START_OF_ACTIVITY turn_coverage=ONLY_ACTIVITY thinking_budget=0")
 
     room_disconnected = asyncio.Event()
     ctx.room.on("disconnected", lambda *_: room_disconnected.set())

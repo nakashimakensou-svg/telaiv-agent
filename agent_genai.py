@@ -22,6 +22,7 @@ from livekit import rtc
 from livekit.agents import JobContext, WorkerOptions, cli
 from google import genai
 from google.genai import types as genai_types
+from telai_prompts import build_telai_prompt
 
 load_dotenv()
 
@@ -47,15 +48,6 @@ EMERGENCY_KEYWORDS = ["雨漏り", "水漏れ", "緊急", "事故"]
 
 DEFAULT_GREETING = "はい、お電話ありがとうございます。"
 DEFAULT_ESCALATION_KEYWORDS = ["クレーム", "担当者", "責任者", "上の者", "社長"]
-
-OUTBOUND_TEST_INTRO_PROMPT = """\
-あなたはTelaivのテスト発信AIです。
-電話に出た相手に対して、すぐに次のセリフで挨拶してください:
-「お世話になります。テライブからのテスト発信です。音声確認のためお電話しました。30秒ほどよろしいでしょうか。」
-相手の応答に対して自然な会話を5往復程度継続してください。
-会話が終わったら「ありがとうございました。テスト発信を終了します。失礼いたします。」と言って会話を終えてください。
-営業時間案内や他の案内は一切不要です。
-"""
 
 # ─── 汎用対応ルール（全テナント共通・上書き不可）─────────────────────────────
 # {business_hours_note} は run_conversation で動的に差し込む
@@ -1203,11 +1195,11 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # Outbound 発信の場合は専用プロンプトで run_conversation を実行して終了
     if call_type == "outbound_sales":
-        if scenario == "test_intro":
-            override_prompt = OUTBOUND_TEST_INTRO_PROMPT
-        else:
-            override_prompt = OUTBOUND_TEST_INTRO_PROMPT  # 将来は別プロンプトに差し替え
-        logger.info(f"[DEBUG] outbound_sales detected — using override_system_prompt scenario={scenario!r}")
+        _scenario = scenario if scenario in ("test_intro", "sales", "inbound") else "test_intro"
+        _customer_context = meta.get("customer_context", None)
+        override_prompt = build_telai_prompt(scenario=_scenario, customer_context=_customer_context)
+        logger.info(f"[DEBUG] outbound_sales detected — using telai_prompts v1.0 scenario={_scenario!r}")
+        logger.info(f"[DEBUG] telai_prompts: scenario={_scenario}, length={len(override_prompt)} chars")
 
         call_log_id: str = meta.get("call_log_id", "")
 

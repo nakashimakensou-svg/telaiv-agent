@@ -1306,20 +1306,30 @@ async def entrypoint(ctx: JobContext) -> None:
                 transcript=transcript,
                 override_system_prompt=override_prompt,
             ) or "completed"
+        except asyncio.CancelledError:
+            # LiveKit cancels the task when the room closes — catch explicitly so finally runs
+            logger.warning("outbound: run_conversation cancelled (room closed by LiveKit)")
+            conv_outcome = "error"
         except Exception:
             logger.error("outbound: run_conversation raised", exc_info=True)
             conv_outcome = "error"
-
-        duration = int((datetime.now(timezone.utc) - start_time).total_seconds())
-        transcript_text = "\n".join(
-            f"[{'AI' if t.get('role') == 'agent' else 'USER'}] {t.get('text', '')}"
-            for t in transcript if t.get("text")
-        )
-        logger.info(
-            f"outbound: conversation ended outcome={conv_outcome} "
-            f"duration={duration}s transcript_lines={len(transcript)}"
-        )
-        await update_call_log_on_end(call_log_id, duration, transcript_text, None, conv_outcome)
+        finally:
+            duration = int((datetime.now(timezone.utc) - start_time).total_seconds())
+            transcript_text = "\n".join(
+                f"[{'AI' if t.get('role') == 'agent' else 'USER'}] {t.get('text', '')}"
+                for t in transcript if t.get("text")
+            )
+            logger.info(
+                f"outbound: conversation ended outcome={conv_outcome} "
+                f"duration={duration}s transcript_lines={len(transcript)}"
+            )
+            try:
+                # asyncio.shield protects the DB update from outer task cancellation
+                await asyncio.shield(
+                    update_call_log_on_end(call_log_id, duration, transcript_text, None, conv_outcome)
+                )
+            except Exception:
+                logger.error("outbound: update_call_log_on_end failed in cleanup", exc_info=True)
         return
 
     called_number: Optional[str] = None

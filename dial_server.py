@@ -64,10 +64,19 @@ class DialRequest(BaseModel):
 
 
 def _sb_headers() -> dict[str, str]:
+    """Headers for POST/PATCH requests (with body)."""
     return {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
+    }
+
+
+def _sb_get_headers() -> dict[str, str]:
+    """Headers for GET requests — no Content-Type to avoid confusing PostgREST."""
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
     }
 
 
@@ -78,24 +87,28 @@ async def fetch_stage_prompts_from_db(tenant_id: str) -> dict:
       {"seeding": {"prompt_addition": "...", "opening_line": "...", ...}}
     Returns {} on error or if no prompts configured.
     """
-    if not SUPABASE_URL or not SUPABASE_KEY or not tenant_id:
+    sb_url = SUPABASE_URL.rstrip("/") if SUPABASE_URL else ""
+    if not sb_url or not SUPABASE_KEY or not tenant_id:
         return {}
     try:
         async with aiohttp.ClientSession() as session:
             # Step 1: get concierge_config id for tenant
             async with session.get(
-                f"{SUPABASE_URL}/rest/v1/concierge_configs",
-                headers=_sb_headers(),
+                f"{sb_url}/rest/v1/concierge_configs",
+                headers=_sb_get_headers(),
                 params={
                     "tenant_id": f"eq.{tenant_id}",
                     "select": "id",
-                    "order": "created_at.asc",
                     "limit": "1",
                 },
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if not resp.ok:
-                    logger.warning(f"fetch_stage_prompts_from_db: concierge_configs query failed status={resp.status}")
+                    body = await resp.text()
+                    logger.warning(
+                        f"fetch_stage_prompts_from_db: concierge_configs query failed "
+                        f"status={resp.status} body={body!r}"
+                    )
                     return {}
                 configs = await resp.json()
                 if not configs:
@@ -104,8 +117,8 @@ async def fetch_stage_prompts_from_db(tenant_id: str) -> dict:
 
             # Step 2: get stage_prompts for that config
             async with session.get(
-                f"{SUPABASE_URL}/rest/v1/concierge_stage_prompts",
-                headers=_sb_headers(),
+                f"{sb_url}/rest/v1/concierge_stage_prompts",
+                headers=_sb_get_headers(),
                 params={
                     "concierge_config_id": f"eq.{config_id}",
                     "select": "stage,prompt_addition,opening_line,closing_line,max_duration_seconds,goals,forbidden_phrases",
@@ -113,7 +126,11 @@ async def fetch_stage_prompts_from_db(tenant_id: str) -> dict:
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if not resp.ok:
-                    logger.warning(f"fetch_stage_prompts_from_db: stage_prompts query failed status={resp.status}")
+                    body = await resp.text()
+                    logger.warning(
+                        f"fetch_stage_prompts_from_db: stage_prompts query failed "
+                        f"status={resp.status} body={body!r}"
+                    )
                     return {}
                 rows = await resp.json()
                 result = {r["stage"]: r for r in rows if r.get("stage")}

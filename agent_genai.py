@@ -974,7 +974,16 @@ async def run_conversation(
     logger.info("[DEBUG] turn_detection: silence=400ms padding=100ms sensitivity=HIGH/HIGH interrupts=START_OF_ACTIVITY turn_coverage=ONLY_ACTIVITY thinking_budget=0")
 
     room_disconnected = asyncio.Event()
+    sip_participant_disconnected = asyncio.Event()
+
     ctx.room.on("disconnected", lambda *_: room_disconnected.set())
+
+    def _on_participant_disconnected(participant) -> None:
+        identity = getattr(participant, "identity", "?")
+        logger.info(f"run_conversation: remote participant disconnected: {identity}")
+        sip_participant_disconnected.set()
+
+    ctx.room.on("participant_disconnected", _on_participant_disconnected)
 
     # 割り込み時に play_audio へ即時フラッシュを指示するイベント
     _flush_evt: asyncio.Event = asyncio.Event()
@@ -1185,10 +1194,12 @@ async def run_conversation(
                 asyncio.create_task(listen_audio(),         name="listen"),
                 asyncio.create_task(send_realtime(session), name="send"),
             ]
-            disc_task = asyncio.create_task(room_disconnected.wait(), name="disconnect")
+            disc_task     = asyncio.create_task(room_disconnected.wait(),            name="room_disconnect")
+            sip_disc_task = asyncio.create_task(sip_participant_disconnected.wait(), name="sip_disconnect")
+            timeout_task  = asyncio.create_task(asyncio.sleep(300),                  name="timeout_300s")
 
             done, pending = await asyncio.wait(
-                wait_tasks + [disc_task],
+                wait_tasks + [disc_task, sip_disc_task, timeout_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
@@ -1199,7 +1210,7 @@ async def run_conversation(
                         f"{type(t.exception()).__name__}: {t.exception()}"
                     )
                 else:
-                    logger.info(f"Task '{t.get_name()}' completed first")
+                    logger.info(f"Task '{t.get_name()}' completed first — ending conversation")
 
             for t in pending:
                 t.cancel()
